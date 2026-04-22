@@ -1,27 +1,17 @@
 import logging
 import asyncio
-import mysql.connector
-from datetime import datetime, timedelta
+import sqlite3
+from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
-import json
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8600527005:AAFYeIcMzjKfIkn41amkWkJ2_eqIoddiF5E"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
+TOKEN = "8524888141:AAFNuxrcYSeGqiWUAcWBCUp6abFHshVYBgY"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
 ADMIN_ID = 7673683792
 
-# MySQL настройки (замени на свои)
-DB_CONFIG = {
-    'host': 'localhost',
-    'user': 'whg107696_higgy',
-    'password': 'Pawlin228',
-    'database': 'whg107696_higgy',
-    'charset': 'utf8mb4'
-}
-
-# ========== ИНИЦИАЛИЗАЦИЯ ==========
 logging.basicConfig(level=logging.INFO)
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
@@ -36,136 +26,127 @@ GAMES = {
     'football': {'name': 'Футбол', 'emoji': '⚽', 'min': 1, 'max': 5}
 }
 
-# ========== РАБОТА С БАЗОЙ ДАННЫХ ==========
-def get_db_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
+# ========== РАБОТА С БАЗОЙ ДАННЫХ (SQLite) ==========
 def init_db():
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     
     # Таблица статистики игроков
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS players (
-            user_id BIGINT PRIMARY KEY,
-            name VARCHAR(255),
-            wins INT DEFAULT 0,
-            games_played INT DEFAULT 0
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            wins INTEGER DEFAULT 0,
+            games_played INTEGER DEFAULT 0
         )
     ''')
     
     # Таблица для рассылки (подписанные чаты)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chats (
-            chat_id BIGINT PRIMARY KEY,
-            chat_name VARCHAR(255),
-            is_active BOOLEAN DEFAULT TRUE
+            chat_id INTEGER PRIMARY KEY,
+            chat_name TEXT,
+            is_active INTEGER DEFAULT 1
         )
     ''')
     
     conn.commit()
-    cursor.close()
     conn.close()
 
 def add_win(user_id: int, name: str):
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO players (user_id, name, wins, games_played)
-        VALUES (%s, %s, 1, 1)
-        ON DUPLICATE KEY UPDATE
+        VALUES (?, ?, 1, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
         wins = wins + 1,
         games_played = games_played + 1,
-        name = %s
-    ''', (user_id, name, name))
+        name = excluded.name
+    ''', (user_id, name))
     conn.commit()
-    cursor.close()
     conn.close()
 
 def add_loss(user_id: int, name: str):
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO players (user_id, name, wins, games_played)
-        VALUES (%s, %s, 0, 1)
-        ON DUPLICATE KEY UPDATE
+        VALUES (?, ?, 0, 1)
+        ON CONFLICT(user_id) DO UPDATE SET
         games_played = games_played + 1,
-        name = %s
-    ''', (user_id, name, name))
+        name = excluded.name
+    ''', (user_id, name))
     conn.commit()
-    cursor.close()
     conn.close()
 
 def get_top(limit: int = 10):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+    conn = sqlite3.connect('uralchik_bot.db')
+    cursor = conn.cursor()
     cursor.execute('''
         SELECT user_id, name, wins, games_played
         FROM players
         ORDER BY wins DESC
-        LIMIT %s
+        LIMIT ?
     ''', (limit,))
     result = cursor.fetchall()
-    cursor.close()
     conn.close()
-    return result
+    return [{'user_id': r[0], 'name': r[1], 'wins': r[2], 'games_played': r[3]} for r in result]
 
 def get_player_stats(user_id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
+    conn = sqlite3.connect('uralchik_bot.db')
+    cursor = conn.cursor()
     cursor.execute('''
         SELECT user_id, name, wins, games_played
         FROM players
-        WHERE user_id = %s
+        WHERE user_id = ?
     ''', (user_id,))
     result = cursor.fetchone()
-    cursor.close()
     conn.close()
-    return result
+    if result:
+        return {'user_id': result[0], 'name': result[1], 'wins': result[2], 'games_played': result[3]}
+    return None
 
 def reset_stats():
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
-    cursor.execute('TRUNCATE TABLE players')
+    cursor.execute('DELETE FROM players')
     conn.commit()
-    cursor.close()
     conn.close()
 
 def add_win_to_player(user_id: int, name: str, wins_to_add: int):
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO players (user_id, name, wins, games_played)
-        VALUES (%s, %s, %s, 0)
-        ON DUPLICATE KEY UPDATE
-        wins = wins + %s,
-        name = %s
-    ''', (user_id, name, wins_to_add, wins_to_add, name))
+        VALUES (?, ?, ?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET
+        wins = wins + ?,
+        name = excluded.name
+    ''', (user_id, name, wins_to_add, wins_to_add))
     conn.commit()
-    cursor.close()
     conn.close()
 
 def add_chat(chat_id: int, chat_name: str):
-    conn = get_db_connection()
+    conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO chats (chat_id, chat_name, is_active)
-        VALUES (%s, %s, TRUE)
-        ON DUPLICATE KEY UPDATE
-        chat_name = %s, is_active = TRUE
-    ''', (chat_id, chat_name, chat_name))
+        VALUES (?, ?, 1)
+        ON CONFLICT(chat_id) DO UPDATE SET
+        chat_name = excluded.chat_name,
+        is_active = 1
+    ''', (chat_id, chat_name))
     conn.commit()
-    cursor.close()
     conn.close()
 
 def get_all_chats():
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute('SELECT chat_id, chat_name FROM chats WHERE is_active = TRUE')
+    conn = sqlite3.connect('uralchik_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT chat_id, chat_name FROM chats WHERE is_active = 1')
     result = cursor.fetchall()
-    cursor.close()
     conn.close()
-    return result
+    return [{'chat_id': r[0], 'chat_name': r[1]} for r in result]
 
 # ========== АДМИНСКИЕ КОМАНДЫ ==========
 def is_admin(user_id: int) -> bool:
@@ -217,7 +198,6 @@ async def admin_add_wins_prompt(callback: types.CallbackQuery):
             user_id = int(user_id)
             wins = int(wins)
             
-            # Получаем имя пользователя
             try:
                 user = await bot.get_chat(user_id)
                 name = user.first_name
@@ -228,9 +208,6 @@ async def admin_add_wins_prompt(callback: types.CallbackQuery):
             await msg.reply(f"✅ Добавлено {wins} побед игроку {name} (ID: {user_id})")
         except Exception as e:
             await msg.reply(f"❌ Ошибка: {e}")
-        
-        # Удаляем временный хендлер
-        dp.message.handlers.pop()
 
 @dp.callback_query(F.data == "admin_mailing")
 async def admin_mailing_prompt(callback: types.CallbackQuery):
@@ -260,11 +237,10 @@ async def admin_mailing_prompt(callback: types.CallbackQuery):
                 pass
         
         # Отправляем лично игрокам из статистики
-        conn = get_db_connection()
+        conn = sqlite3.connect('uralchik_bot.db')
         cursor = conn.cursor()
         cursor.execute('SELECT DISTINCT user_id FROM players')
         users = cursor.fetchall()
-        cursor.close()
         conn.close()
         
         user_success = 0
@@ -276,9 +252,6 @@ async def admin_mailing_prompt(callback: types.CallbackQuery):
                 pass
         
         await msg.reply(f"✅ Рассылка завершена!\n📢 Чатов получено: {success}\n👤 Игроков получено: {user_success}")
-        
-        # Удаляем временный хендлер
-        dp.message.handlers.pop()
 
 @dp.callback_query(F.data == "admin_list_chats")
 async def admin_list_chats(callback: types.CallbackQuery):
@@ -309,7 +282,6 @@ async def start_game(message: types.Message, game_type: str):
         await message.reply("⚠️ Игра уже создана! Дождитесь окончания.")
         return
     
-    # Добавляем чат в базу для рассылки
     add_chat(chat_id, message.chat.title or "Беседа")
     
     game_info = GAMES[game_type]
@@ -334,7 +306,6 @@ async def start_game(message: types.Message, game_type: str):
         'start_time': datetime.now()
     }
     
-    # Автоотмена через 5 минут
     await asyncio.sleep(300)
     if chat_id in games:
         await cancel_game(chat_id)
@@ -397,18 +368,17 @@ async def process_join_game(callback_query: types.CallbackQuery):
     
     await callback_query.answer(f"✅ Ты присоединился к игре против {player1_name}!")
     
-    # Удаляем кнопку
     await bot.edit_message_reply_markup(chat_id, game['message_id'], reply_markup=None)
     
     game_info = GAMES[game_type_stored]
     
-    # Отправляем первый кубик (ждём 5 секунд)
+    # Первый игрок кидает (5 секунд)
     msg = await bot.send_message(chat_id, f"{game_info['emoji']} *{player1_name}* кидает...", parse_mode="Markdown")
     await asyncio.sleep(2)
     dice1 = await bot.send_dice(chat_id, emoji=game_info['emoji'])
     await asyncio.sleep(3)
     
-    # Отправляем второй кубик (ждём 5 секунд)
+    # Второй игрок кидает (5 секунд)
     await bot.edit_message_text(f"{game_info['emoji']} *{joiner_name}* кидает...", chat_id, msg.message_id, parse_mode="Markdown")
     await asyncio.sleep(2)
     dice2 = await bot.send_dice(chat_id, emoji=game_info['emoji'])
@@ -417,7 +387,6 @@ async def process_join_game(callback_query: types.CallbackQuery):
     score1 = dice1.dice.value
     score2 = dice2.dice.value
     
-    # Определяем победителя
     if score1 > score2:
         winner_id = player1_id
         winner_name = player1_name
@@ -493,7 +462,8 @@ async def cmd_help(message: types.Message):
         "/darts - дартс 🎯 (1-6)\n"
         "/football - футбол ⚽ (1-5)\n"
         "/top - топ победителей 🏆\n"
-        "/stats - моя статистика 📊\n\n"
+        "/stats - моя статистика 📊\n"
+        "/admin - админ-панель (только для админа)\n\n"
         "⏱️ *Как играть:*\n"
         "1. Участник создаёт игру\n"
         "2. Второй участник нажимает кнопку (5 минут!)\n"
