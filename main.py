@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8524888141:AAFNuxrcYSeGqiWUAcWBCUp6abFHshVYBgY"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
+TOKEN = "8600527005:AAFYeIcMzjKfIkn41amkWkJ2_eqIoddiF5E"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
 ADMIN_ID = 7673683792
 
 logging.basicConfig(level=logging.INFO)
@@ -15,8 +15,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Словарь для активных игр
+# Словарь для активных игр и состояний админа
 games = {}
+admin_states = {}  # {user_id: 'waiting_for_mailing' или 'waiting_for_add_wins'}
 
 # Доступные игры
 GAMES = {
@@ -31,7 +32,6 @@ def init_db():
     conn = sqlite3.connect('uralchik_bot.db')
     cursor = conn.cursor()
     
-    # Таблица статистики игроков
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS players (
             user_id INTEGER PRIMARY KEY,
@@ -41,7 +41,6 @@ def init_db():
         )
     ''')
     
-    # Таблица для рассылки (подписанные чаты)
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chats (
             chat_id INTEGER PRIMARY KEY,
@@ -183,31 +182,16 @@ async def admin_add_wins_prompt(callback: types.CallbackQuery):
         await callback.answer("Нет доступа!")
         return
     
+    admin_states[callback.from_user.id] = 'waiting_for_add_wins'
+    
     await callback.message.edit_text(
         "➕ *Добавление побед игроку*\n\n"
         "Отправьте ID пользователя и количество побед в формате:\n"
         "`123456789 5`\n\n"
-        "Пример: `7673683792 10`",
+        "Пример: `7673683792 10`\n\n"
+        "Или нажмите /cancel для отмены.",
         parse_mode="Markdown"
     )
-    
-    @dp.message(lambda msg: msg.from_user.id == ADMIN_ID and msg.text and len(msg.text.split()) == 2)
-    async def add_wins_handler(msg: types.Message):
-        try:
-            user_id, wins = msg.text.split()
-            user_id = int(user_id)
-            wins = int(wins)
-            
-            try:
-                user = await bot.get_chat(user_id)
-                name = user.first_name
-            except:
-                name = f"User_{user_id}"
-            
-            add_win_to_player(user_id, name, wins)
-            await msg.reply(f"✅ Добавлено {wins} побед игроку {name} (ID: {user_id})")
-        except Exception as e:
-            await msg.reply(f"❌ Ошибка: {e}")
 
 @dp.callback_query(F.data == "admin_mailing")
 async def admin_mailing_prompt(callback: types.CallbackQuery):
@@ -215,43 +199,15 @@ async def admin_mailing_prompt(callback: types.CallbackQuery):
         await callback.answer("Нет доступа!")
         return
     
+    admin_states[callback.from_user.id] = 'waiting_for_mailing'
+    
     await callback.message.edit_text(
         "📢 *Рассылка*\n\n"
         "Отправьте текст сообщения для рассылки.\n"
-        "Сообщение будет отправлено во все чаты и лично каждому игроку.",
+        "Сообщение будет отправлено во все чаты и лично каждому игроку.\n\n"
+        "Или нажмите /cancel для отмены.",
         parse_mode="Markdown"
     )
-    
-    @dp.message(lambda msg: msg.from_user.id == ADMIN_ID and msg.text)
-    async def mailing_handler(msg: types.Message):
-        text = msg.text
-        
-        # Отправляем в чаты
-        chats = get_all_chats()
-        success = 0
-        for chat in chats:
-            try:
-                await bot.send_message(chat['chat_id'], f"📢 *Рассылка от администратора:*\n\n{text}", parse_mode="Markdown")
-                success += 1
-            except:
-                pass
-        
-        # Отправляем лично игрокам из статистики
-        conn = sqlite3.connect('uralchik_bot.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT DISTINCT user_id FROM players')
-        users = cursor.fetchall()
-        conn.close()
-        
-        user_success = 0
-        for (user_id,) in users:
-            try:
-                await bot.send_message(user_id, f"📢 *Рассылка от администратора:*\n\n{text}", parse_mode="Markdown")
-                user_success += 1
-            except:
-                pass
-        
-        await msg.reply(f"✅ Рассылка завершена!\n📢 Чатов получено: {success}\n👤 Игроков получено: {user_success}")
 
 @dp.callback_query(F.data == "admin_list_chats")
 async def admin_list_chats(callback: types.CallbackQuery):
@@ -269,6 +225,83 @@ async def admin_list_chats(callback: types.CallbackQuery):
         text += f"• {chat['chat_name']} (ID: {chat['chat_id']})\n"
     
     await callback.message.edit_text(text, parse_mode="Markdown")
+
+@dp.message(Command("cancel"))
+async def cancel_action(message: types.Message):
+    if message.from_user.id in admin_states:
+        del admin_states[message.from_user.id]
+        await message.reply("✅ Действие отменено!")
+    else:
+        await message.reply("❌ Нет активных действий для отмены.")
+
+# Обработчик для добавления побед
+@dp.message(lambda msg: msg.from_user.id == ADMIN_ID and admin_states.get(msg.from_user.id) == 'waiting_for_add_wins')
+async def handle_add_wins(message: types.Message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            await message.reply("❌ Неверный формат! Используйте: `ID КОЛИЧЕСТВО`\nПример: `7673683792 10`", parse_mode="Markdown")
+            return
+        
+        user_id, wins = parts
+        user_id = int(user_id)
+        wins = int(wins)
+        
+        try:
+            user = await bot.get_chat(user_id)
+            name = user.first_name
+        except:
+            name = f"User_{user_id}"
+        
+        add_win_to_player(user_id, name, wins)
+        await message.reply(f"✅ Добавлено {wins} побед игроку {name} (ID: {user_id})")
+        
+    except ValueError:
+        await message.reply("❌ Ошибка: ID должен быть числом, количество побед - числом!")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
+    finally:
+        # Удаляем состояние админа
+        if message.from_user.id in admin_states:
+            del admin_states[message.from_user.id]
+
+# Обработчик для рассылки
+@dp.message(lambda msg: msg.from_user.id == ADMIN_ID and admin_states.get(msg.from_user.id) == 'waiting_for_mailing')
+async def handle_mailing(message: types.Message):
+    text = message.text
+    
+    # Отправляем в чаты
+    chats = get_all_chats()
+    success_chats = 0
+    for chat in chats:
+        try:
+            await bot.send_message(chat['chat_id'], f"📢 *Рассылка от администратора:*\n\n{text}", parse_mode="Markdown")
+            success_chats += 1
+            await asyncio.sleep(0.5)  # небольшая задержка, чтобы не спамить
+        except Exception as e:
+            logging.error(f"Не удалось отправить в чат {chat['chat_id']}: {e}")
+    
+    # Отправляем лично игрокам из статистики
+    conn = sqlite3.connect('uralchik_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT user_id FROM players')
+    users = cursor.fetchall()
+    conn.close()
+    
+    success_users = 0
+    for (user_id,) in users:
+        try:
+            await bot.send_message(user_id, f"📢 *Рассылка от администратора:*\n\n{text}", parse_mode="Markdown")
+            success_users += 1
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logging.error(f"Не удалось отправить пользователю {user_id}: {e}")
+    
+    await message.reply(f"✅ Рассылка завершена!\n📢 Чатов получено: {success_chats}\n👤 Игроков получено: {success_users}")
+    
+    # Удаляем состояние админа
+    if message.from_user.id in admin_states:
+        del admin_states[message.from_user.id]
 
 # ========== ИГРОВЫЕ КОМАНДЫ ==========
 async def start_game(message: types.Message, game_type: str):
@@ -306,6 +339,7 @@ async def start_game(message: types.Message, game_type: str):
         'start_time': datetime.now()
     }
     
+    # Автоотмена через 5 минут
     await asyncio.sleep(300)
     if chat_id in games:
         await cancel_game(chat_id)
@@ -463,7 +497,8 @@ async def cmd_help(message: types.Message):
         "/football - футбол ⚽ (1-5)\n"
         "/top - топ победителей 🏆\n"
         "/stats - моя статистика 📊\n"
-        "/admin - админ-панель (только для админа)\n\n"
+        "/admin - админ-панель (только для админа)\n"
+        "/cancel - отменить текущее действие\n\n"
         "⏱️ *Как играть:*\n"
         "1. Участник создаёт игру\n"
         "2. Второй участник нажимает кнопку (5 минут!)\n"
