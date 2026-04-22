@@ -1,8 +1,8 @@
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils import executor
+import asyncio
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import Command
 
 # Токен бота (замени на свой)
 TOKEN = "8524888141:AAFNuxrcYSeGqiWUAcWBCUp6abFHshVYBgY"
@@ -10,20 +10,19 @@ TOKEN = "8524888141:AAFNuxrcYSeGqiWUAcWBCUp6abFHshVYBgY"
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
+dp = Dispatcher()
 
-# Словарь для хранения ожидающих игроков {chat_id: {'player1_id': int, 'player1_name': str, 'message_id': int}}
+# Словарь для хранения ожидающих игроков
 pending_games = {}
 
-@dp.message_handler(commands=['start'])
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.reply(
         "🎲 Привет! Я бот UralchikGame\n"
         "Используй команду /kube чтобы сыграть в кости с другим игроком."
     )
 
-@dp.message_handler(commands=['kube'])
+@dp.message(Command("kube"))
 async def cmd_kube(message: types.Message):
     chat_id = message.chat.id
     
@@ -31,9 +30,9 @@ async def cmd_kube(message: types.Message):
         await message.reply("⚠️ Игра уже создана! Дождитесь, пока кто-то присоединится.")
         return
     
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    join_button = InlineKeyboardButton("🎲 Присоединиться к игре", callback_data="join_game")
-    keyboard.add(join_button)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎲 Присоединиться к игре", callback_data="join_game")]
+    ])
     
     sent_msg = await message.reply(
         f"🎲 {message.from_user.first_name} создал игру в кости!\n"
@@ -47,7 +46,7 @@ async def cmd_kube(message: types.Message):
         'message_id': sent_msg.message_id
     }
 
-@dp.callback_query_handler(lambda c: c.data == 'join_game')
+@dp.callback_query(F.data == "join_game")
 async def process_join_game(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     joiner_id = callback_query.from_user.id
@@ -110,7 +109,7 @@ async def process_join_game(callback_query: types.CallbackQuery):
     
     del pending_games[chat_id]
 
-@dp.message_handler(commands=['help'])
+@dp.message(Command("help"))
 async def cmd_help(message: types.Message):
     await message.reply(
         "🎮 *UralchikGame - команды:*\n\n"
@@ -121,5 +120,8 @@ async def cmd_help(message: types.Message):
         parse_mode="Markdown"
     )
 
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == '__main__':
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
