@@ -7,7 +7,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 
 # ========== НАСТРОЙКИ ==========
-TOKEN = "8600527005:AAFYeIcMzjKfIkn41amkWkJ2_eqIoddiF5E"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
+TOKEN = "8524888141:AAFNuxrcYSeGqiWUAcWBCUp6abFHshVYBgY"  # ЗАМЕНИ НА НОВЫЙ ТОКЕН!
 ADMIN_ID = 7673683792
 
 logging.basicConfig(level=logging.INFO)
