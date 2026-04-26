@@ -6,17 +6,17 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # ⚙️ КОНФИГУРАЦИЯ (только токен)
 BOT_TOKEN = "8605102614:AAFf8aTK7e0ei9yxc2lky2bUUIAfdTK8_HY"
 
-# 🔧 НАСТРОЙКИ МОДЕРАЦИИ (можно менять)
-ANTI_FLOOD = True          # Защита от флуда
-FLOOD_TIME = 3             # секунд между сообщениями
-MAX_WARNS = 3              # предупреждений до мута
-MUTE_TIME = 5              # минут мута
-DELETE_BAD_WORDS = True    # удалять сообщения с запрещёнными словами
-FORBIDDEN_WORDS = ["хуй", "пизда", "бля", "сука", "редиска"]  # пример
+# 🔧 НАСТРОЙКИ МОДЕРАЦИИ
+ANTI_FLOOD = True
+FLOOD_TIME = 3
+MAX_WARNS = 3
+MUTE_TIME = 5
+DELETE_BAD_WORDS = True
+FORBIDDEN_WORDS = ["хуй", "пизда", "бля", "сука"]
 
-# 📊 Временное хранилище (при перезапуске сбрасывается)
-user_warns = {}      # {chat_id: {user_id: warns_count}}
-user_last_msg = {}   # {chat_id: {user_id: timestamp}}
+# 📊 Хранилище
+user_warns = {}
+user_last_msg = {}
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def get_warns(chat_id, user_id):
@@ -33,7 +33,6 @@ def reset_warns(chat_id, user_id):
         user_warns[chat_id][user_id] = 0
 
 async def is_chat_admin(update: Update, user_id: int) -> bool:
-    """Проверяет, является ли пользователь админом в этом чате"""
     try:
         chat_member = await update.effective_chat.get_member(user_id)
         return chat_member.status in ['administrator', 'creator']
@@ -41,7 +40,6 @@ async def is_chat_admin(update: Update, user_id: int) -> bool:
         return False
 
 async def mute_user(chat, user_id, minutes, reason=""):
-    """Замутить пользователя на N минут"""
     until_date = asyncio.get_event_loop().time() + minutes * 60
     await chat.restrict_member(
         user_id=user_id,
@@ -52,7 +50,6 @@ async def mute_user(chat, user_id, minutes, reason=""):
         await chat.send_message(f"🔇 Пользователь замучен на {minutes} мин. Причина: {reason}")
 
 async def unmute_user(chat, user_id):
-    """Размутить пользователя"""
     await chat.restrict_member(
         user_id=user_id,
         permissions=ChatPermissions(
@@ -63,9 +60,8 @@ async def unmute_user(chat, user_id):
         )
     )
 
-# ==================== КОМАНДЫ ДЛЯ АДМИНОВ ====================
+# ==================== КОМАНДЫ ====================
 async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/mute @username [минут] - замутить пользователя"""
     if not await is_chat_admin(update, update.effective_user.id):
         await update.message.reply_text("⛔ Только администраторы чата")
         return
@@ -93,7 +89,6 @@ async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔇 {target.first_name} замучен на {duration} минут")
 
 async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/unmute @username - размутить"""
     if not await is_chat_admin(update, update.effective_user.id):
         await update.message.reply_text("⛔ Только администраторы")
         return
@@ -114,7 +109,6 @@ async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ {target.first_name} размучен")
 
 async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/warn @username - выдать предупреждение"""
     if not await is_chat_admin(update, update.effective_user.id):
         await update.message.reply_text("⛔ Только администраторы")
         return
@@ -142,7 +136,6 @@ async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ {target.first_name} | Предупреждение {warns}/{MAX_WARNS}")
 
 async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/warns [@username] - показать предупреждения"""
     target_id = update.effective_user.id
     target_name = "вас"
     
@@ -158,9 +151,8 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     warns_count = get_warns(update.effective_chat.id, target_id)
     await update.message.reply_text(f"📊 У {target_name} {warns_count}/{MAX_WARNS} предупреждений")
 
-# ==================== ОБРАБОТЧИКИ СООБЩЕНИЙ ====================
+# ==================== ОБРАБОТЧИКИ ====================
 async def anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверка на флуд"""
     if not ANTI_FLOOD:
         return True
     
@@ -182,7 +174,6 @@ async def anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return True
 
 async def bad_words_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Фильтр запрещённых слов"""
     if not DELETE_BAD_WORDS:
         return True
     
@@ -198,41 +189,37 @@ async def bad_words_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return True
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Основной обработчик сообщений"""
-    # Не проверяем сообщения от ботов
     if update.effective_user.is_bot:
         return
     
-    # Админы чата могут писать что угодно
     if await is_chat_admin(update, update.effective_user.id):
         return
     
-    # Проверка на флуд
     if not await anti_flood(update, context):
         return
     
-    # Фильтр мата
     if not await bad_words_filter(update, context):
         return
 
-# ==================== ЗАПУСК БОТА ====================
-async def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+# ==================== ЗАПУСК (ИСПРАВЛЕННЫЙ) ====================
+def main():
+    """Главная функция с правильной обработкой event loop"""
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Команды
-    app.add_handler(CommandHandler("mute", mute))
-    app.add_handler(CommandHandler("unmute", unmute))
-    app.add_handler(CommandHandler("warn", warn))
-    app.add_handler(CommandHandler("warns", warns))
+    application.add_handler(CommandHandler("mute", mute))
+    application.add_handler(CommandHandler("unmute", unmute))
+    application.add_handler(CommandHandler("warn", warn))
+    application.add_handler(CommandHandler("warns", warns))
     
     # Обработка сообщений
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Инфо при старте
     print("✅ Бот запущен! Добавьте его в любую группу и сделайте администратором.")
     print("📌 Доступные команды: /mute, /unmute, /warn, /warns")
     
-    await app.run_polling()
+    # Запуск без asyncio.run() конфликта
+    application.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
