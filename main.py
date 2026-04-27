@@ -1,225 +1,255 @@
+import os
+import subprocess
+import tempfile
+import shutil
+import logging
 import asyncio
-from datetime import datetime
-from telegram import Update, ChatPermissions
+from pathlib import Path
+from dotenv import load_dotenv
+from telegram import Update, Document
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# ⚙️ КОНФИГУРАЦИЯ (только токен)
-BOT_TOKEN = "8605102614:AAFf8aTK7e0ei9yxc2lky2bUUIAfdTK8_HY"
+# Загружаем токен
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN not found! Please check .env file")
 
-# 🔧 НАСТРОЙКИ МОДЕРАЦИИ
-ANTI_FLOOD = True
-FLOOD_TIME = 3
-MAX_WARNS = 3
-MUTE_TIME = 5
-DELETE_BAD_WORDS = True
-FORBIDDEN_WORDS = ["хуй", "пизда", "бля", "сука"]
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# 📊 Хранилище
-user_warns = {}
-user_last_msg = {}
+# Настройки компилятора Pawn
+# Укажите полный путь к pawncc, если он не в PATH
+PAWNCC_PATH = "pawncc"  # или r"C:\Program Files\pawno\pawncc.exe" для Windows
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
-def get_warns(chat_id, user_id):
-    return user_warns.get(chat_id, {}).get(user_id, 0)
+# Дополнительные флаги компиляции
+COMPILE_FLAGS = ['-;+', '-\\+', '-(+', '-d0', '-r']
 
-def add_warn(chat_id, user_id):
-    if chat_id not in user_warns:
-        user_warns[chat_id] = {}
-    user_warns[chat_id][user_id] = user_warns[chat_id].get(user_id, 0) + 1
-    return user_warns[chat_id][user_id]
+# Максимальный размер файла (20 MB - лимит Telegram)
+MAX_FILE_SIZE = 20 * 1024 * 1024
 
-def reset_warns(chat_id, user_id):
-    if chat_id in user_warns and user_id in user_warns[chat_id]:
-        user_warns[chat_id][user_id] = 0
-
-async def is_chat_admin(update: Update, user_id: int) -> bool:
-    try:
-        chat_member = await update.effective_chat.get_member(user_id)
-        return chat_member.status in ['administrator', 'creator']
-    except:
-        return False
-
-async def mute_user(chat, user_id, minutes, reason=""):
-    until_date = asyncio.get_event_loop().time() + minutes * 60
-    await chat.restrict_member(
-        user_id=user_id,
-        permissions=ChatPermissions(can_send_messages=False),
-        until_date=until_date
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    await update.message.reply_text(
+        "🤖 **Pawn Compiler Bot**\n\n"
+        "Отправьте мне `.pwn` файл, и я скомпилирую его в `.amx`\n\n"
+        "**Как использовать:**\n"
+        "1. Отправьте файл с расширением `.pwn`\n"
+        "2. Дождитесь компиляции\n"
+        "3. Получите готовый `.amx` файл\n\n"
+        "📖 **Доступные команды:**\n"
+        "/start - Показать это сообщение\n"
+        "/help - Получить справку\n"
+        "/info - Информация о боте",
+        parse_mode="Markdown"
     )
-    if reason:
-        await chat.send_message(f"🔇 Пользователь замучен на {minutes} мин. Причина: {reason}")
 
-async def unmute_user(chat, user_id):
-    await chat.restrict_member(
-        user_id=user_id,
-        permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_media_messages=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    await update.message.reply_text(
+        "📚 **Справка по использованию:**\n\n"
+        "**1. Отправка файла:**\n"
+        "Просто отправьте файл с расширением `.pwn` в чат\n\n"
+        "**2. Процесс компиляции:**\n"
+        "Бот автоматически обнаружит файл и запустит компиляцию\n\n"
+        "**3. Результат:**\n"
+        "• При успехе - получите `.amx` файл\n"
+        "• При ошибке - получите сообщение об ошибке\n\n"
+        "**4. Ограничения:**\n"
+        f"• Максимальный размер файла: {MAX_FILE_SIZE // (1024*1024)} MB\n"
+        "• Время компиляции: до 30 секунд\n\n"
+        "**5. Важно:**\n"
+        "Все необходимые `.inc` файлы должны быть установлены на сервере!",
+        parse_mode="Markdown"
+    )
+
+async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /info"""
+    # Проверяем наличие компилятора
+    compiler_exists = shutil.which(PAWNCC_PATH) is not None
+    
+    info_text = (
+        "ℹ️ **Информация о боте:**\n\n"
+        f"**Версия:** 1.0.0\n"
+        f"**Компилятор Pawn:** {'✅ Доступен' if compiler_exists else '❌ Не найден'}\n"
+        f"**Путь к компилятору:** `{PAWNCC_PATH}`\n\n"
+        "**Поддерживаемые форматы:**\n"
+        "• Вход: `.pwn`\n"
+        "• Выход: `.amx`\n\n"
+        "**Автор:** @your_username"
+    )
+    
+    await update.message.reply_text(info_text, parse_mode="Markdown")
+    
+    if not compiler_exists:
+        await update.message.reply_text(
+            "⚠️ **Внимание:** Компилятор Pawn не найден!\n\n"
+            "Убедитесь, что:\n"
+            "1. Pawn компилятор установлен\n"
+            "2. Путь к нему указан корректно в переменной `PAWNCC_PATH`\n"
+            "3. Компилятор есть в PATH системы",
+            parse_mode="Markdown"
         )
+
+async def compile_pawn(pwn_path: Path, work_dir: Path) -> tuple[bool, str, Path | None]:
+    """
+    Компилирует .pwn файл в .amx
+    
+    Returns:
+        tuple: (success, output_message, amx_path_or_none)
+    """
+    try:
+        # Подготовка команды
+        cmd = [PAWNCC_PATH, str(pwn_path)] + COMPILE_FLAGS
+        
+        logger.info(f"Running: {' '.join(cmd)}")
+        
+        # Запускаем компиляцию
+        result = subprocess.run(
+            cmd,
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=True if os.name == 'nt' else False
+        )
+        
+        # Ищем скомпилированный файл
+        amx_path = pwn_path.with_suffix('.amx')
+        
+        # Успешная компиляция
+        if result.returncode == 0 and amx_path.exists() and amx_path.stat().st_size > 0:
+            return True, "✅ Компиляция успешно завершена!", amx_path
+        
+        # Ошибка компиляции
+        error_msg = result.stderr if result.stderr else result.stdout
+        if not error_msg or error_msg.strip() == "":
+            error_msg = "Неизвестная ошибка компиляции"
+        
+        # Обрезаем слишком длинные сообщения
+        if len(error_msg) > 4000:
+            error_msg = error_msg[:4000] + "\n\n... (сообщение обрезано)"
+        
+        return False, f"❌ **Ошибка компиляции:**\n```\n{error_msg}\n```", None
+        
+    except subprocess.TimeoutExpired:
+        return False, "⏰ **Ошибка:** Превышено время компиляции (30 секунд)", None
+    except FileNotFoundError:
+        return False, f"❌ **Ошибка:** Компилятор не найден по пути `{PAWNCC_PATH}`\n\nПроверьте установку Pawn компилятора", None
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        return False, f"❌ **Непредвиденная ошибка:** `{str(e)}`", None
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик входящих документов"""
+    document = update.message.document
+    
+    # Проверяем, что это файл .pwn
+    if not document.file_name or not document.file_name.lower().endswith('.pwn'):
+        await update.message.reply_text(
+            "❌ **Пожалуйста, отправьте файл с расширением `.pwn`**\n\n"
+            "Отправьте файл исходного кода Pawn для компиляции.",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Проверяем размер файла
+    if document.file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            f"❌ **Файл слишком большой!**\n\n"
+            f"Максимальный размер: {MAX_FILE_SIZE // (1024*1024)} MB\n"
+            f"Ваш файл: {document.file_size // (1024*1024)} MB",
+            parse_mode="Markdown"
+        )
+        return
+    
+    # Отправляем статус
+    status_msg = await update.message.reply_text(
+        "🔄 **Компиляция началась...**\n\n"
+        f"Файл: `{document.file_name}`\n"
+        "Пожалуйста, подождите...",
+        parse_mode="Markdown"
     )
-
-# ==================== КОМАНДЫ ====================
-async def mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_chat_admin(update, update.effective_user.id):
-        await update.message.reply_text("⛔ Только администраторы чата")
-        return
     
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /mute @username [минут]")
-        return
-    
-    duration = 5
-    if len(context.args) > 1 and context.args[1].isdigit():
-        duration = int(context.args[1])
-    
-    try:
-        username = context.args[0].replace('@', '')
-        users = await update.effective_chat.get_members(filter=username)
-        if not users:
-            await update.message.reply_text("❌ Пользователь не найден")
-            return
-        target = users[0].user
-    except:
-        await update.message.reply_text("❌ Не удалось найти пользователя")
-        return
-    
-    await mute_user(update.effective_chat, target.id, duration, f"команда /mute от {update.effective_user.first_name}")
-    await update.message.reply_text(f"🔇 {target.first_name} замучен на {duration} минут")
-
-async def unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_chat_admin(update, update.effective_user.id):
-        await update.message.reply_text("⛔ Только администраторы")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /unmute @username")
-        return
-    
-    try:
-        username = context.args[0].replace('@', '')
-        users = await update.effective_chat.get_members(filter=username)
-        target = users[0].user
-    except:
-        await update.message.reply_text("❌ Пользователь не найден")
-        return
-    
-    await unmute_user(update.effective_chat, target.id)
-    await update.message.reply_text(f"✅ {target.first_name} размучен")
-
-async def warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_chat_admin(update, update.effective_user.id):
-        await update.message.reply_text("⛔ Только администраторы")
-        return
-    
-    if not context.args:
-        await update.message.reply_text("❌ Использование: /warn @username")
-        return
-    
-    try:
-        username = context.args[0].replace('@', '')
-        users = await update.effective_chat.get_members(filter=username)
-        target = users[0].user
-    except:
-        await update.message.reply_text("❌ Пользователь не найден")
-        return
-    
-    chat_id = update.effective_chat.id
-    warns = add_warn(chat_id, target.id)
-    
-    if warns >= MAX_WARNS:
-        await mute_user(update.effective_chat, target.id, MUTE_TIME, f"{MAX_WARNS} предупреждений")
-        await update.message.reply_text(f"⚠️ {target.first_name} получил {warns}/{MAX_WARNS} предупреждений и замучен на {MUTE_TIME} минут")
-        reset_warns(chat_id, target.id)
-    else:
-        await update.message.reply_text(f"⚠️ {target.first_name} | Предупреждение {warns}/{MAX_WARNS}")
-
-async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    target_id = update.effective_user.id
-    target_name = "вас"
-    
-    if context.args and await is_chat_admin(update, update.effective_user.id):
+    # Создаем временную директорию
+    with tempfile.TemporaryDirectory() as tmpdir:
+        work_dir = Path(tmpdir)
+        
         try:
-            username = context.args[0].replace('@', '')
-            users = await update.effective_chat.get_members(filter=username)
-            target_id = users[0].user.id
-            target_name = users[0].user.first_name
-        except:
-            pass
-    
-    warns_count = get_warns(update.effective_chat.id, target_id)
-    await update.message.reply_text(f"📊 У {target_name} {warns_count}/{MAX_WARNS} предупреждений")
-
-# ==================== ОБРАБОТЧИКИ ====================
-async def anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ANTI_FLOOD:
-        return True
-    
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    now = datetime.now().timestamp()
-    
-    if chat_id not in user_last_msg:
-        user_last_msg[chat_id] = {}
-    
-    last_time = user_last_msg[chat_id].get(user_id, 0)
-    
-    if now - last_time < FLOOD_TIME:
-        await update.message.delete()
-        await update.effective_chat.send_message(f"🚫 {update.effective_user.first_name}, не флуди!", delete_in_secs=5)
-        return False
-    
-    user_last_msg[chat_id][user_id] = now
-    return True
-
-async def bad_words_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not DELETE_BAD_WORDS:
-        return True
-    
-    text = update.message.text.lower()
-    for word in FORBIDDEN_WORDS:
-        if word in text:
-            await update.message.delete()
-            await update.effective_chat.send_message(
-                f"🤬 {update.effective_user.first_name}, ваше сообщение удалено (запрещённое слово)",
-                delete_in_secs=5
+            # Скачиваем файл
+            file = await context.bot.get_file(document.file_id)
+            pwn_path = work_dir / document.file_name
+            await file.download_to_drive(pwn_path)
+            
+            logger.info(f"Downloaded file: {pwn_path}, size: {pwn_path.stat().st_size} bytes")
+            
+            # Компилируем
+            success, message, amx_path = await compile_pawn(pwn_path, work_dir)
+            
+            if success and amx_path and amx_path.exists():
+                # Отправляем успешный результат
+                await status_msg.delete()
+                
+                with open(amx_path, 'rb') as amx_file:
+                    output_filename = pwn_path.stem + '.amx'
+                    await update.message.reply_document(
+                        document=amx_file,
+                        filename=output_filename,
+                        caption=f"✅ **Компиляция успешна!**\n\nИсходный файл: `{document.file_name}`\nРазмер: {amx_path.stat().st_size:,} байт",
+                        parse_mode="Markdown"
+                    )
+            else:
+                # Отправляем ошибку
+                await status_msg.edit_text(message, parse_mode="Markdown")
+                
+        except Exception as e:
+            logger.error(f"Error processing document: {e}", exc_info=True)
+            await status_msg.edit_text(
+                f"❌ **Произошла ошибка при обработке файла:**\n\n```\n{str(e)}\n```",
+                parse_mode="Markdown"
             )
-            return False
-    return True
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.is_bot:
-        return
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Глобальный обработчик ошибок"""
+    logger.error(f"Update {update} caused error {context.error}", exc_info=context.error)
     
-    if await is_chat_admin(update, update.effective_user.id):
-        return
-    
-    if not await anti_flood(update, context):
-        return
-    
-    if not await bad_words_filter(update, context):
-        return
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
+            "⚠️ **Внутренняя ошибка бота**\n\n"
+            "Пожалуйста, попробуйте позже или сообщите администратору.",
+            parse_mode="Markdown"
+        )
 
-# ==================== ЗАПУСК (ИСПРАВЛЕННЫЙ) ====================
 def main():
-    """Главная функция с правильной обработкой event loop"""
-    application = Application.builder().token(BOT_TOKEN).build()
+    """Запуск бота"""
+    # Проверяем наличие компилятора при старте
+    compiler_path = shutil.which(PAWNCC_PATH)
+    if compiler_path:
+        logger.info(f"Pawn compiler found at: {compiler_path}")
+    else:
+        logger.warning(f"Pawn compiler not found at: {PAWNCC_PATH}")
     
-    # Команды
-    application.add_handler(CommandHandler("mute", mute))
-    application.add_handler(CommandHandler("unmute", unmute))
-    application.add_handler(CommandHandler("warn", warn))
-    application.add_handler(CommandHandler("warns", warns))
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
     
-    # Обработка сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("info", info_command))
     
-    print("✅ Бот запущен! Добавьте его в любую группу и сделайте администратором.")
-    print("📌 Доступные команды: /mute, /unmute, /warn, /warns")
+    # Регистрируем обработчик документов
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
-    # Запуск без asyncio.run() конфликта
-    application.run_polling()
+    # Регистрируем обработчик ошибок
+    application.add_error_handler(error_handler)
+    
+    # Запускаем бота
+    logger.info("Bot started! Waiting for .pwn files...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
