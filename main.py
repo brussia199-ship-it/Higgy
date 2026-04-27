@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # Токен прямо в коде (ВРЕМЕННОЕ РЕШЕНИЕ)
 TOKEN = "8781058326:AAEyJEbz9V6YvXIQy9JF90uRyI2nskDXw0Y"
 
-PAWNCC_PATH = "/app/pawncc.exe"
+PAWNCC_PATH = "pawncc.exe"
 user_last_message = {}
 
 async def anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE, cooldown=3):
