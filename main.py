@@ -8,7 +8,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 load_dotenv()
-TOKEN = os.getenv("8781058326:AAEyJEbz9V6YvXIQy9JF90uRyI2nskDXw0Y")
+TOKEN = "8781058326:AAEyJEbz9V6YvXIQy9JF90uRyI2nskDXw0Y"
 
 if not TOKEN:
     print("❌ Ошибка: BOT_TOKEN не найден!")
