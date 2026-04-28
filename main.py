@@ -25,7 +25,7 @@ from PIL import Image
 
 # ========== НАСТРОЙКИ ==========
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8784427450:AAFIy3r1o2qawyZ5I4pRkmBnRPjEAXlgEE0")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyA0NJlRthA6sUgFKQHdCgMscGhCwUiYtk8")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBBrbYgSv3bItNRs01g2UGpps3JRJZV9hg")
 
 if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
     raise ValueError("❌ Укажите TELEGRAM_TOKEN в переменных окружения!")
@@ -34,7 +34,7 @@ if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
 
 # НАСТРОЙКА МОДЕЛИ — используем актуальное название
 # Популярные бесплатные модели: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-1.5-pro
-GEMINI_MODEL = "gemini-1.5-flash"  # или "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-1.5-pro"  # или "gemini-1.5-flash"
 
 # Правильный URL для API (без /v1beta, используем /v1)
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
