@@ -34,7 +34,7 @@ if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
 
 # НАСТРОЙКА МОДЕЛИ — используем актуальное название
 # Популярные бесплатные модели: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-1.5-pro
-GEMINI_MODEL = "gemini-1.5-pro"  # или "gemini-1.5-flash"
+GEMINI_MODEL = "gemini-1.5-flash"  # или "gemini-1.5-flash"
 
 # Правильный URL для API (без /v1beta, используем /v1)
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
