@@ -1,40 +1,50 @@
 import telebot
-import requests
+import subprocess
+import os
+import tempfile
 
 TOKEN = "8781058326:AAEyJEbz9V6YvXIQy9JF90uRyI2nskDXw0Y"
+
 bot = telebot.TeleBot(TOKEN)
 
-CHANNELS = ["@russiakrmp", "@UralPwn"]
-
-def check_sub(user_id):
-    for ch in CHANNELS:
-        try:
-            status = bot.get_chat_member(ch, user_id).status
-            if status in ["left", "kicked"]:
-                return False, ch
-        except:
-            return False, ch
-    return True, None
-
-@bot.message_handler(commands=['start'])
-def start(message):
-    ok, need = check_sub(message.from_user.id)
-    if not ok:
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("📢 Подписаться", url=f"https://t.me/{need[1:]}"))
-        markup.add(telebot.types.InlineKeyboardButton("✅ Проверить", callback_data="check"))
-        bot.reply_to(message, f"⚠️ Подпишись: {need}", reply_markup=markup)
+@bot.message_handler(content_types=['document'])
+def compile_pwn(message):
+    if not message.document.file_name.endswith('.pwn'):
+        bot.reply_to(message, 'Кидай .pwn файл')
         return
-    bot.reply_to(message, "✅ Отправь .pwn файл")
 
-@bot.callback_query_handler(func=lambda c: c.data == "check")
-def callback(c):
-    ok, _ = check_sub(c.from_user.id)
-    if ok:
-        bot.edit_message_text("✅ Доступ открыт", c.message.chat.id, c.message.message_id)
-    else:
-        bot.answer_callback_query(c.id, "Подпишись", True)
+    msg = bot.reply_to(message, 'Компиляция...')
+    
+    with tempfile.TemporaryDirectory() as tmp:
+        file_info = bot.get_file(message.document.file_id)
+        pwn_content = bot.download_file(file_info.file_path)
+        
+        pwn_path = os.path.join(tmp, 'script.pwn')
+        amx_path = os.path.join(tmp, 'script.amx')
+        
+        with open(pwn_path, 'wb') as f:
+            f.write(pwn_content)
+        
+        # Путь к компилятору (положи pawncc.exe рядом с bot.py)
+        compiler = os.path.join(os.path.dirname(__file__), 'pawncc.exe')
+        
+        if not os.path.exists(compiler):
+            bot.edit_message_text('Скачайте pawncc.exe и положите рядом с ботом', message.chat.id, msg.message_id)
+            return
+        
+        cmd = f'"{compiler}" "{pwn_path}" -o"{amx_path}" -; -('
+        process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+        
+        if os.path.exists(amx_path) and os.path.getsize(amx_path) > 0:
+            with open(amx_path, 'rb') as amx_file:
+                bot.send_document(message.chat.id, amx_file)
+            bot.delete_message(message.chat.id, msg.message_id)
+        else:
+            error = process.stderr or process.stdout or 'Ошибка компиляции'
+            bot.edit_message_text(f'Ошибка:\n{error[:500]}', message.chat.id, msg.message_id)
 
+print('Бот запущен')
+bot.infinity_polling()
 @bot.message_handler(content_types=['document'])
 def compile(message):
     ok, _ = check_sub(message.from_user.id)
