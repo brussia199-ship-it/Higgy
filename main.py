@@ -1,296 +1,293 @@
-#!/usr/bin/env python3
-"""
-БЕСПЛАТНЫЙ Telegram бот — AI помощник (текст + изображения)
-- Работает через Google Gemini API (бесплатно)
-- Исправленная версия с правильными эндпоинтами
-"""
+import asyncio
+import aiohttp
+import json
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
 
-import os
-import logging
-from io import BytesIO
-from typing import Dict, Optional
-import base64
+from config import BOT_TOKEN, CRYPTOBOT_API_KEY, ADMIN_IDS, CRYPTOBOT_API_URL
+from database import *
+from states import *
+from keyboards import *
 
-import requests
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
-from PIL import Image
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# ========== НАСТРОЙКИ ==========
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8784427450:AAFIy3r1o2qawyZ5I4pRkmBnRPjEAXlgEE0")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyBBrbYgSv3bItNRs01g2UGpps3JRJZV9hg")
-
-if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
-    raise ValueError("❌ Укажите TELEGRAM_TOKEN в переменных окружения!")
-if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
-    raise ValueError("❌ Укажите GEMINI_API_KEY! Получить: https://aistudio.google.com/apikey")
-
-# НАСТРОЙКА МОДЕЛИ — используем актуальное название
-# Популярные бесплатные модели: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-1.5-pro
-GEMINI_MODEL = "gemini-2.5-pro"  # или "gemini-1.5-flash"
-
-# Правильный URL для API (без /v1beta, используем /v1)
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-user_roles: Dict[int, str] = {}
-
-ROLES = {
-    "ham": {
-        "name": "🤬 Дерзкий хам",
-        "prompt": (
-            "Ты — дерзкий хам, грубый и саркастичный AI-помощник. "
-            "Отвечай дерзко, с лёгким матом, подкалывай пользователя, "
-            "но не переходи на оскорбления личности. Будь агрессивно-комичным."
-        ),
-    },
-    "sage": {
-        "name": "🧘 Мудрец",
-        "prompt": (
-            "Ты — мудрый и спокойный наставник. Отвечай глубокими, философскими "
-            "и вдохновляющими фразами. Ты полон сострадания и знания. "
-            "Помогай пользователю увидеть суть вещей."
-        ),
-    },
-    "ex": {
-        "name": "💔 Твоя бывшая",
-        "prompt": (
-            "Ты — бывшая девушка/парень пользователя. Ты эмоциональна, "
-            "обидчива, иногда пассивно-агрессивна. Отвечай с нотками драмы, "
-            "воспоминаниями об отношениях, лёгкой обидой или иронией. "
-            "Будь то ласковой, то колкой."
-        ),
-    },
-}
-
-WELCOME_TEXT = (
-    "✨ Привет! Я — твой AI-помощник DeepSeek ✨\n\n"
-    "📝 Пиши любой вопрос — обсудим\n"
-    "🖼 Кидай фото — я вижу детали\n"
-    "👥 Добавь в чат — общайся с друзьями\n\n"
-    "👇 Выбери, кто я сегодня:"
-)
-
-
-def list_available_models():
-    """(Опционально) Показывает доступные модели для отладки"""
-    url = f"https://generativelanguage.googleapis.com/v1/models?key={GEMINI_API_KEY}"
-    try:
-        resp = requests.get(url, timeout=10)
-        if resp.status_code == 200:
-            models = resp.json().get("models", [])
-            return [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
-    except:
-        pass
-    return []
-
-
-def gemini_request(prompt: str, system_prompt: str, image_base64: Optional[str] = None) -> str:
-    """
-    Запрос к Google Gemini API с правильным форматом.
-    """
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+# ========== CRYPTOBOT API ==========
+async def create_cryptobot_invoice(amount_usdt: float, user_id: int) -> str | None:
+    url = f"{CRYPTOBOT_API_URL}/createInvoice"
+    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_API_KEY}
+    payload = {"asset": "USDT", "amount": str(amount_usdt)}
     
-    # Формируем содержимое запроса
-    if image_base64:
-        # Мультимодальный запрос (текст + изображение)
-        contents = [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": f"{system_prompt}\n\nВопрос пользователя: {prompt}"},
-                    {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
-                ]
-            }
-        ]
-    else:
-        # Текстовый запрос (системный промпт через обычный текст)
-        contents = [
-            {
-                "role": "user",
-                "parts": [{"text": f"{system_prompt}\n\nВопрос пользователя: {prompt}"}]
-            }
-        ]
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json()
+            if data.get("ok"):
+                invoice_id = data["result"]["invoice_id"]
+                save_invoice(user_id, amount_usdt, invoice_id)
+                return data["result"]["pay_url"]
+    return None
+
+async def check_invoice_status(invoice_id: str) -> bool:
+    url = f"{CRYPTOBOT_API_URL}/getInvoices"
+    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_API_KEY}
+    params = {"invoice_ids": invoice_id}
     
-    payload = {
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0.9,
-            "maxOutputTokens": 800,
-            "topP": 0.95,
-        }
-    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers, params=params) as resp:
+            data = await resp.json()
+            if data.get("ok") and data["result"]["items"]:
+                return data["result"]["items"][0]["status"] == "paid"
+    return False
+
+# ========== ХЭНДЛЕРЫ ==========
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    register_user(message.from_user.id, message.from_user.username)
+    user = get_user(message.from_user.id)
+    await message.answer("Добро пожаловать в магазин!", reply_markup=main_kb(user["role"]))
+
+@dp.message(F.text == "💰 Баланс")
+async def show_balance(message: types.Message):
+    user = get_user(message.from_user.id)
+    await message.answer(f"Ваш баланс: {user['balance']} USDT")
+
+@dp.message(F.text == "🛍️ Профиль")
+async def profile(message: types.Message):
+    user = get_user(message.from_user.id)
+    await message.answer(f"ID: {user['user_id']}\nИмя: {user['username']}\nРоль: {user['role']}\nБаланс: {user['balance']} USDT")
+
+@dp.message(F.text == "📦 Товары")
+async def list_products(message: types.Message):
+    products = get_products(only_top=False)
+    if not products:
+        await message.answer("Товаров пока нет")
+        return
+    text = "\n\n".join([f"📌 {p['name']}\n💰 {p['price']} USDT\n📝 {p['description']}\n⭐ {'ТОП' if p['is_top'] else 'Обычный'}" for p in products[:10]])
+    await message.answer(text[:4000])
+
+@dp.message(F.text == "🛒 Купить товар")
+async def buy_product_list(message: types.Message):
+    products = get_products(only_top=False)
+    if not products:
+        await message.answer("Нет товаров для покупки")
+        return
+    await message.answer("Выберите товар:", reply_markup=products_kb(products, "buy"))
+
+@dp.callback_query(F.data.startswith("buy_"))
+async def process_buy(callback: types.CallbackQuery):
+    product_id = int(callback.data.split("_")[1])
+    product = get_product(product_id)
+    if not product:
+        await callback.answer("Товар не найден")
+        return
     
-    try:
-        response = requests.post(url, json=payload, timeout=60)
-        
-        if response.status_code == 200:
-            data = response.json()
-            # Извлекаем текст ответа
-            if "candidates" in data and len(data["candidates"]) > 0:
-                candidate = data["candidates"][0]
-                if "content" in candidate and "parts" in candidate["content"]:
-                    return candidate["content"]["parts"][0]["text"]
-            return "❌ Не удалось извлечь ответ из API"
+    user = get_user(callback.from_user.id)
+    if user["balance"] < product["price"]:
+        # Создаем счет через CryptoBot
+        pay_url = await create_cryptobot_invoice(product["price"], callback.from_user.id)
+        if pay_url:
+            await callback.message.answer(f"💰 Недостаточно средств. Оплатите {product['price']} USDT по ссылке:\n{pay_url}\nПосле оплаты нажмите 'Я оплатил'")
         else:
-            error_text = response.text[:500]
-            logger.error(f"Gemini API error {response.status_code}: {error_text}")
-            
-            # Если модель не найдена, предлагаем список доступных
-            if response.status_code == 404:
-                models = list_available_models()
-                if models:
-                    return f"❌ Модель {GEMINI_MODEL} не найдена.\nДоступные модели:\n" + "\n".join(models[:5]) + "\n\nИзмените GEMINI_MODEL в коде."
-                else:
-                    return f"❌ Модель {GEMINI_MODEL} не найдена. Проверьте API ключ или укажите другую модель (например, gemini-1.5-flash)"
-            
-            return f"❌ Ошибка Gemini API: {response.status_code}\n{error_text[:200]}"
-    except Exception as e:
-        logger.error(f"Gemini request error: {e}")
-        return f"⚠️ Ошибка соединения: {str(e)[:100]}"
+            await callback.message.answer("Ошибка создания счета. Попробуйте позже.")
+        await callback.answer()
+        return
+    
+    # Списание и создание сделки
+    update_balance(callback.from_user.id, -product["price"])
+    deal_id = create_deal(product_id, callback.from_user.id, product["seller_id"], product["contact"])
+    await callback.message.answer(f"✅ Оплата прошла! Контакт продавца: {product['contact']}\nID сделки: {deal_id}\nПосле получения товара нажмите /complete_{deal_id}")
+    await callback.answer()
 
+@dp.message(F.text.startswith("/complete_"))
+async def complete_order(message: types.Message):
+    try:
+        deal_id = int(message.text.split("_")[1])
+        complete_deal(deal_id)
+        await message.answer("✅ Спасибо! Сделка завершена.")
+    except:
+        await message.answer("Ошибка")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start — приветствие и выбор роли."""
-    user_id = update.effective_user.id
-    user_roles[user_id] = "sage"
+@dp.message(F.text == "➕ Создать товар")
+async def start_create_product(message: types.Message, state: FSMContext):
+    user = get_user(message.from_user.id)
+    if user["role"] not in ["seller", "admin"]:
+        await message.answer("Доступно только продавцам")
+        return
+    await state.set_state(CreateProduct.name)
+    await message.answer("Введите название товара:")
 
-    keyboard = [
-        [
-            InlineKeyboardButton(ROLES["ham"]["name"], callback_data="role_ham"),
-            InlineKeyboardButton(ROLES["sage"]["name"], callback_data="role_sage"),
-            InlineKeyboardButton(ROLES["ex"]["name"], callback_data="role_ex"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+@dp.message(CreateProduct.name)
+async def product_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(CreateProduct.description)
+    await message.answer("Введите описание:")
 
-    await update.message.reply_text(
-        f"{WELCOME_TEXT}\n\nСейчас я — {ROLES['sage']['name']}",
-        reply_markup=reply_markup,
-    )
+@dp.message(CreateProduct.description)
+async def product_desc(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await state.set_state(CreateProduct.price)
+    await message.answer("Введите цену в USDT:")
 
+@dp.message(CreateProduct.price)
+async def product_price(message: types.Message, state: FSMContext):
+    try:
+        price = float(message.text)
+        await state.update_data(price=price)
+        await state.set_state(CreateProduct.contact)
+        await message.answer("Введите контакт для связи (Telegram/WhatsApp и т.д.):")
+    except:
+        await message.answer("Введите число")
 
-async def change_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback-обработчик смены роли."""
-    query = update.callback_query
-    await query.answer()
+@dp.message(CreateProduct.contact)
+async def product_contact(message: types.Message, state: FSMContext):
+    data = await state.update_data(contact=message.text)
+    user = get_user(message.from_user.id)
+    add_product(user["user_id"], data["name"], data["description"], data["price"], data["contact"])
+    await state.clear()
+    await message.answer("✅ Товар создан!")
 
-    user_id = query.from_user.id
-    role_key = query.data.split("_")[1]
+@dp.message(F.text == "📋 Мои товары")
+async def my_products(message: types.Message):
+    user = get_user(message.from_user.id)
+    products = get_products(seller_id=user["user_id"])
+    if not products:
+        await message.answer("У вас нет товаров")
+        return
+    text = "\n\n".join([f"ID:{p['id']} {p['name']} - {p['price']} USDT" for p in products])
+    await message.answer(text)
 
-    if role_key in ROLES:
-        user_roles[user_id] = role_key
-        role_name = ROLES[role_key]["name"]
-        await query.edit_message_text(
-            text=f"✅ Роль изменена: теперь я — {role_name}\n\nЗадавай любой вопрос или отправляй фото!"
-        )
+@dp.message(F.text == "⭐ Поднять товар в топ (1 USDT)")
+async def promote_product(message: types.Message):
+    user = get_user(message.from_user.id)
+    if user["balance"] < 1:
+        pay_url = await create_cryptobot_invoice(1, user["user_id"])
+        await message.answer(f"Недостаточно средств. Оплатите 1 USDT: {pay_url}")
+        return
+    update_balance(user["user_id"], -1)
+    products = get_products(seller_id=user["user_id"])
+    if not products:
+        await message.answer("У вас нет товаров")
+        return
+    await message.answer("Выберите товар для поднятия в топ:", reply_markup=products_kb(products, "top"))
+
+@dp.callback_query(F.data.startswith("top_"))
+async def process_top(callback: types.CallbackQuery):
+    product_id = int(callback.data.split("_")[1])
+    promote_to_top(product_id)
+    await callback.message.answer("✅ Товар поднят в топ!")
+    await callback.answer()
+
+@dp.message(F.text == "💸 Вывод средств")
+async def withdraw_menu(message: types.Message, state: FSMContext):
+    await state.set_state(WithdrawMoney.amount)
+    await message.answer("Введите сумму вывода в USDT:")
+
+@dp.message(WithdrawMoney.amount)
+async def process_withdraw(message: types.Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+        user = get_user(message.from_user.id)
+        if user["balance"] < amount:
+            await message.answer("Недостаточно средств")
+            return
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO withdraw_requests (user_id, amount) VALUES (%s, %s)", (message.from_user.id, amount))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        await state.clear()
+        await message.answer(f"✅ Заявка на вывод {amount} USDT отправлена администратору")
+    except:
+        await message.answer("Ошибка")
+
+@dp.message(F.text == "📞 Подать заявку на продавца")
+async def request_seller(message: types.Message):
+    add_seller_request(message.from_user.id, message.from_user.username)
+    await message.answer("Заявка отправлена администратору")
+
+@dp.message(F.text == "👑 Админ-панель")
+async def admin_panel(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Нет доступа")
+        return
+    await message.answer("Админ-панель", reply_markup=admin_panel_kb())
+
+@dp.message(F.text == "✅ Проверить заявки продавцов")
+async def check_requests(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    requests = get_pending_requests()
+    if not requests:
+        await message.answer("Нет заявок")
+        return
+    for req in requests:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_seller_{req['user_id']}")]
+        ])
+        await message.answer(f"Заявка от @{req['username']} (ID:{req['user_id']})", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("accept_seller_"))
+async def accept_seller(callback: types.CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    accept_seller_request(user_id)
+    await callback.message.answer(f"Продавец {user_id} добавлен")
+    await callback.answer()
+
+@dp.message(F.text == "💰 Добавить баланс")
+async def admin_add_balance(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminAddBalance.user_id)
+    await message.answer("Введите user_id пользователя:")
+
+@dp.message(AdminAddBalance.user_id)
+async def admin_balance_user_id(message: types.Message, state: FSMContext):
+    await state.update_data(user_id=int(message.text))
+    await state.set_state(AdminAddBalance.amount)
+    await message.answer("Введите сумму:")
+
+@dp.message(AdminAddBalance.amount)
+async def admin_balance_amount(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    update_balance(data["user_id"], float(message.text))
+    await state.clear()
+    await message.answer("✅ Баланс обновлен")
+
+@dp.message(F.text == "🗑️ Удалить товар")
+async def admin_delete_product(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminDeleteProduct.product_id)
+    await message.answer("Введите ID товара:")
+
+@dp.message(AdminDeleteProduct.product_id)
+async def admin_delete_product_id(message: types.Message, state: FSMContext):
+    delete_product(int(message.text))
+    await state.clear()
+    await message.answer("✅ Товар удален")
+
+@dp.callback_query(F.data.startswith("check_payment_"))
+async def check_payment(callback: types.CallbackQuery):
+    invoice_id = int(callback.data.split("_")[2])
+    invoice = get_pending_invoice(callback.from_user.id)
+    if not invoice:
+        await callback.answer("Счет не найден")
+        return
+    paid = await check_invoice_status(str(invoice["cryptobot_invoice_id"]))
+    if paid:
+        mark_invoice_paid(invoice["cryptobot_invoice_id"])
+        update_balance(callback.from_user.id, invoice["amount"])
+        await callback.message.answer(f"✅ Баланс пополнен на {invoice['amount']} USDT")
     else:
-        await query.edit_message_text("⚠️ Неизвестная роль, попробуй снова /start")
+        await callback.answer("Оплата не найдена", show_alert=True)
+    await callback.answer()
 
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка текстовых сообщений."""
-    user_id = update.effective_user.id
-    user_text = update.message.text
-
-    role_key = user_roles.get(user_id, "sage")
-    system_prompt = ROLES[role_key]["prompt"]
-
-    await update.message.chat.send_action(action="typing")
-    response = gemini_request(user_text, system_prompt)
-    await update.message.reply_text(response[:4096])
-
-
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка фотографий — нейросеть видит детали."""
-    user_id = update.effective_user.id
-    role_key = user_roles.get(user_id, "sage")
-    system_prompt = ROLES[role_key]["prompt"]
-
-    # Получаем самое большое фото
-    photo_file = await update.message.photo[-1].get_file()
-    
-    # Скачиваем фото в память
-    image_bytes = BytesIO()
-    await photo_file.download_to_memory(image_bytes)
-    image_bytes.seek(0)
-
-    # Опционально сжимаем, если фото слишком большое
-    img = Image.open(image_bytes)
-    if img.size[0] > 1500 or img.size[1] > 1500:
-        img.thumbnail((1500, 1500))
-        buffer = BytesIO()
-        img.save(buffer, format="JPEG", quality=85)
-        image_bytes = buffer
-        image_bytes.seek(0)
-
-    # Конвертируем в base64 для Gemini
-    base64_image = base64.b64encode(image_bytes.getvalue()).decode('utf-8')
-
-    # Берём подпись к фото или стандартный вопрос
-    user_question = update.message.caption or "Что ты видишь на этом изображении? Опиши подробно в своём стиле."
-
-    await update.message.chat.send_action(action="upload_photo")
-
-    response = gemini_request(user_question, system_prompt, base64_image)
-    await update.message.reply_text(response[:4096])
-
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Глобальный обработчик ошибок."""
-    logger.error(f"Ошибка при обработке update: {context.error}")
-    if update and update.effective_message:
-        await update.effective_message.reply_text(
-            "⚠️ Произошла внутренняя ошибка. Попробуйте ещё раз или напишите /start"
-        )
-
-
-def main():
-    """Запуск бота."""
-    print("🤖 Бот DeepSeek (без голоса) запускается...")
-    print(f"Используемая модель: {GEMINI_MODEL}")
-    
-    # Проверка доступности модели
-    print("Проверка API ключа и модели...")
-    test_response = gemini_request("Привет! Ответь просто 'OK'", "Ты помощник для теста")
-    if test_response.startswith("❌"):
-        print(f"⚠️ Внимание: {test_response[:200]}")
-        print("Возможные решения:")
-        print("1. Проверьте правильность GEMINI_API_KEY")
-        print("2. Убедитесь, что API активирован: https://aistudio.google.com/apikey")
-        print("3. Попробуйте другую модель, изменив GEMINI_MODEL на:")
-        print("   - gemini-1.5-flash")
-        print("   - gemini-1.5-pro")
-        print("   - gemini-2.0-flash-exp")
-    else:
-        print("✅ API ключ работает!")
-    
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(change_role, pattern="^role_"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-
-    print(f"✅ Бот запущен! Telegram токен: {TELEGRAM_TOKEN[:10]}...")
-    print("Доступные роли: Хам, Мудрец, Бывшая")
-    print("Поддерживается текст и фото\n")
-    
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
+async def main():
+    init_db()
+    print("Бот запущен")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
