@@ -15,7 +15,7 @@ PAWNCC_PATH = "./pawncc"  # или "/usr/local/bin/pawncc"
 # Если компилятора нет, скачаем автоматически при первом запуске
 AUTO_DOWNLOAD_COMPILER = True
 
-TEMP_DIR = "./temp_compile"
+TEMP_DIR = "app/temp_compile/"
 os.makedirs(TEMP_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN)
