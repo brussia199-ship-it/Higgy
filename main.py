@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-БЕСПЛАТНЫЙ Telegram бот — AI помощник (только текст + изображения)
+БЕСПЛАТНЫЙ Telegram бот — AI помощник (текст + изображения)
 - Работает через Google Gemini API (бесплатно)
-- Поддержка ролей: Дерзкий хам / Мудрец / Твоя бывшая
-- Никакого голоса — только текст и фото
+- Исправленная версия с правильными эндпоинтами
 """
 
 import os
@@ -33,17 +32,21 @@ if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
 if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
     raise ValueError("❌ Укажите GEMINI_API_KEY! Получить: https://aistudio.google.com/apikey")
 
-# Настройка логирования
+# НАСТРОЙКА МОДЕЛИ — используем актуальное название
+# Популярные бесплатные модели: gemini-2.0-flash-exp, gemini-1.5-flash, gemini-1.5-pro
+GEMINI_MODEL = "gemini-2.0-flash-exp"  # или "gemini-1.5-flash"
+
+# Правильный URL для API (без /v1beta, используем /v1)
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1/models/{GEMINI_MODEL}:generateContent"
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Хранилище ролей пользователей
 user_roles: Dict[int, str] = {}
 
-# Доступные роли
 ROLES = {
     "ham": {
         "name": "🤬 Дерзкий хам",
@@ -81,55 +84,88 @@ WELCOME_TEXT = (
 )
 
 
+def list_available_models():
+    """(Опционально) Показывает доступные модели для отладки"""
+    url = f"https://generativelanguage.googleapis.com/v1/models?key={GEMINI_API_KEY}"
+    try:
+        resp = requests.get(url, timeout=10)
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            return [m["name"] for m in models if "generateContent" in m.get("supportedGenerationMethods", [])]
+    except:
+        pass
+    return []
+
+
 def gemini_request(prompt: str, system_prompt: str, image_base64: Optional[str] = None) -> str:
     """
-    Запрос к Google Gemini API.
-    Если есть image_base64 — используется мультимодальный запрос.
+    Запрос к Google Gemini API с правильным форматом.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    
+    # Формируем содержимое запроса
     if image_base64:
-        # Мультимодальный запрос (текст + картинка)
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
+        # Мультимодальный запрос (текст + изображение)
+        contents = [
+            {
+                "role": "user",
                 "parts": [
-                    {"text": prompt},
+                    {"text": f"{system_prompt}\n\nВопрос пользователя: {prompt}"},
                     {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
                 ]
-            }]
-        }
+            }
+        ]
     else:
-        # Текстовый запрос
-        payload = {
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
-                "parts": [{"text": prompt}]
-            }]
+        # Текстовый запрос (системный промпт через обычный текст)
+        contents = [
+            {
+                "role": "user",
+                "parts": [{"text": f"{system_prompt}\n\nВопрос пользователя: {prompt}"}]
+            }
+        ]
+    
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.9,
+            "maxOutputTokens": 800,
+            "topP": 0.95,
         }
-
+    }
+    
     try:
-        response = requests.post(url, json=payload, timeout=30)
+        response = requests.post(url, json=payload, timeout=60)
+        
         if response.status_code == 200:
             data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+            # Извлекаем текст ответа
+            if "candidates" in data and len(data["candidates"]) > 0:
+                candidate = data["candidates"][0]
+                if "content" in candidate and "parts" in candidate["content"]:
+                    return candidate["content"]["parts"][0]["text"]
+            return "❌ Не удалось извлечь ответ из API"
         else:
-            error_msg = f"Ошибка Gemini API: {response.status_code}\n{response.text[:300]}"
-            logger.error(error_msg)
-            return f"❌ {error_msg}"
+            error_text = response.text[:500]
+            logger.error(f"Gemini API error {response.status_code}: {error_text}")
+            
+            # Если модель не найдена, предлагаем список доступных
+            if response.status_code == 404:
+                models = list_available_models()
+                if models:
+                    return f"❌ Модель {GEMINI_MODEL} не найдена.\nДоступные модели:\n" + "\n".join(models[:5]) + "\n\nИзмените GEMINI_MODEL в коде."
+                else:
+                    return f"❌ Модель {GEMINI_MODEL} не найдена. Проверьте API ключ или укажите другую модель (например, gemini-1.5-flash)"
+            
+            return f"❌ Ошибка Gemini API: {response.status_code}\n{error_text[:200]}"
     except Exception as e:
         logger.error(f"Gemini request error: {e}")
-        return "⚠️ Не удалось связаться с нейросетью. Проверьте интернет и API-ключ."
+        return f"⚠️ Ошибка соединения: {str(e)[:100]}"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start — приветствие и выбор роли."""
     user_id = update.effective_user.id
-    user_roles[user_id] = "sage"  # роль по умолчанию
+    user_roles[user_id] = "sage"
 
     keyboard = [
         [
@@ -152,7 +188,7 @@ async def change_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     user_id = query.from_user.id
-    role_key = query.data.split("_")[1]  # role_ham, role_sage, role_ex
+    role_key = query.data.split("_")[1]
 
     if role_key in ROLES:
         user_roles[user_id] = role_key
@@ -172,18 +208,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role_key = user_roles.get(user_id, "sage")
     system_prompt = ROLES[role_key]["prompt"]
 
-    # Отправляем статус "печатает"
     await update.message.chat.send_action(action="typing")
-
     response = gemini_request(user_text, system_prompt)
-    await update.message.reply_text(response[:4096])  # Telegram лимит 4096 символов
+    await update.message.reply_text(response[:4096])
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка фотографий — нейросеть видит детали."""
     user_id = update.effective_user.id
     role_key = user_roles.get(user_id, "sage")
-    system_prompt = ROLES[role_key]["prompt"] + " Опиши изображение в своём стиле."
+    system_prompt = ROLES[role_key]["prompt"]
 
     # Получаем самое большое фото
     photo_file = await update.message.photo[-1].get_file()
@@ -206,7 +240,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     base64_image = base64.b64encode(image_bytes.getvalue()).decode('utf-8')
 
     # Берём подпись к фото или стандартный вопрос
-    user_question = update.message.caption or "Что ты видишь на этом изображении? Опиши подробно."
+    user_question = update.message.caption or "Что ты видишь на этом изображении? Опиши подробно в своём стиле."
 
     await update.message.chat.send_action(action="upload_photo")
 
@@ -216,7 +250,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Глобальный обработчик ошибок."""
-    logger.error(f"Ошибка при обработке update {update}: {context.error}")
+    logger.error(f"Ошибка при обработке update: {context.error}")
     if update and update.effective_message:
         await update.effective_message.reply_text(
             "⚠️ Произошла внутренняя ошибка. Попробуйте ещё раз или напишите /start"
@@ -225,30 +259,35 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск бота."""
-    # Проверка зависимостей
-    try:
-        from PIL import Image
-    except ImportError:
-        print("⚠️ Установите Pillow: pip install Pillow")
-        return
-
+    print("🤖 Бот DeepSeek (без голоса) запускается...")
+    print(f"Используемая модель: {GEMINI_MODEL}")
+    
+    # Проверка доступности модели
+    print("Проверка API ключа и модели...")
+    test_response = gemini_request("Привет! Ответь просто 'OK'", "Ты помощник для теста")
+    if test_response.startswith("❌"):
+        print(f"⚠️ Внимание: {test_response[:200]}")
+        print("Возможные решения:")
+        print("1. Проверьте правильность GEMINI_API_KEY")
+        print("2. Убедитесь, что API активирован: https://aistudio.google.com/apikey")
+        print("3. Попробуйте другую модель, изменив GEMINI_MODEL на:")
+        print("   - gemini-1.5-flash")
+        print("   - gemini-1.5-pro")
+        print("   - gemini-2.0-flash-exp")
+    else:
+        print("✅ API ключ работает!")
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(change_role, pattern="^role_"))
-
-    # Обработчики сообщений
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Обработчик ошибок
     app.add_error_handler(error_handler)
 
-    print("🤖 Бот DeepSeek (без голоса) запущен!")
-    print(f"Telegram токен: {TELEGRAM_TOKEN[:10]}...")
+    print(f"✅ Бот запущен! Telegram токен: {TELEGRAM_TOKEN[:10]}...")
     print("Доступные роли: Хам, Мудрец, Бывшая")
-    print("Поддерживается текст и фото")
+    print("Поддерживается текст и фото\n")
     
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
