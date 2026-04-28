@@ -1,169 +1,257 @@
+#!/usr/bin/env python3
+"""
+БЕСПЛАТНЫЙ Telegram бот — AI помощник (только текст + изображения)
+- Работает через Google Gemini API (бесплатно)
+- Поддержка ролей: Дерзкий хам / Мудрец / Твоя бывшая
+- Никакого голоса — только текст и фото
+"""
+
 import os
-import subprocess
-import tempfile
-import time
-from pathlib import Path
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import logging
+from io import BytesIO
+from typing import Dict, Optional
+import base64
 
-# Токен прямо в коде (ВРЕМЕННОЕ РЕШЕНИЕ)
-TOKEN = "8781058326:AAEyJEbz9V6YvXIQy9JF90uRyI2nskDXw0Y"
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
+from PIL import Image
 
-PAWNCC_PATH = "/pawncc.exe"
-user_last_message = {}
+# ========== НАСТРОЙКИ ==========
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8784427450:AAFIy3r1o2qawyZ5I4pRkmBnRPjEAXlgEE0")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyA0NJlRthA6sUgFKQHdCgMscGhCwUiYtk8")
 
-async def anti_flood(update: Update, context: ContextTypes.DEFAULT_TYPE, cooldown=3):
-    user_id = update.effective_user.id
-    current_time = time.time()
-    
-    if user_id in user_last_message:
-        if current_time - user_last_message[user_id] < cooldown:
-            await update.message.reply_text(f"🚫 {update.effective_user.first_name}, не флуди! Подожди {cooldown} секунд.")
-            return True
-    
-    user_last_message[user_id] = current_time
-    return False
+if TELEGRAM_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    raise ValueError("❌ Укажите TELEGRAM_TOKEN в переменных окружения!")
+if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+    raise ValueError("❌ Укажите GEMINI_API_KEY! Получить: https://aistudio.google.com/apikey")
+
+# Настройка логирования
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Хранилище ролей пользователей
+user_roles: Dict[int, str] = {}
+
+# Доступные роли
+ROLES = {
+    "ham": {
+        "name": "🤬 Дерзкий хам",
+        "prompt": (
+            "Ты — дерзкий хам, грубый и саркастичный AI-помощник. "
+            "Отвечай дерзко, с лёгким матом, подкалывай пользователя, "
+            "но не переходи на оскорбления личности. Будь агрессивно-комичным."
+        ),
+    },
+    "sage": {
+        "name": "🧘 Мудрец",
+        "prompt": (
+            "Ты — мудрый и спокойный наставник. Отвечай глубокими, философскими "
+            "и вдохновляющими фразами. Ты полон сострадания и знания. "
+            "Помогай пользователю увидеть суть вещей."
+        ),
+    },
+    "ex": {
+        "name": "💔 Твоя бывшая",
+        "prompt": (
+            "Ты — бывшая девушка/парень пользователя. Ты эмоциональна, "
+            "обидчива, иногда пассивно-агрессивна. Отвечай с нотками драмы, "
+            "воспоминаниями об отношениях, лёгкой обидой или иронией. "
+            "Будь то ласковой, то колкой."
+        ),
+    },
+}
+
+WELCOME_TEXT = (
+    "✨ Привет! Я — твой AI-помощник DeepSeek ✨\n\n"
+    "📝 Пиши любой вопрос — обсудим\n"
+    "🖼 Кидай фото — я вижу детали\n"
+    "👥 Добавь в чат — общайся с друзьями\n\n"
+    "👇 Выбери, кто я сегодня:"
+)
+
+
+def gemini_request(prompt: str, system_prompt: str, image_base64: Optional[str] = None) -> str:
+    """
+    Запрос к Google Gemini API.
+    Если есть image_base64 — используется мультимодальный запрос.
+    """
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+    if image_base64:
+        # Мультимодальный запрос (текст + картинка)
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [{
+                "parts": [
+                    {"text": prompt},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": image_base64}}
+                ]
+            }]
+        }
+    else:
+        # Текстовый запрос
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": system_prompt}]
+            },
+            "contents": [{
+                "parts": [{"text": prompt}]
+            }]
+        }
+
+    try:
+        response = requests.post(url, json=payload, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+        else:
+            error_msg = f"Ошибка Gemini API: {response.status_code}\n{response.text[:300]}"
+            logger.error(error_msg)
+            return f"❌ {error_msg}"
+    except Exception as e:
+        logger.error(f"Gemini request error: {e}")
+        return "⚠️ Не удалось связаться с нейросетью. Проверьте интернет и API-ключ."
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start — приветствие и выбор роли."""
+    user_id = update.effective_user.id
+    user_roles[user_id] = "sage"  # роль по умолчанию
+
+    keyboard = [
+        [
+            InlineKeyboardButton(ROLES["ham"]["name"], callback_data="role_ham"),
+            InlineKeyboardButton(ROLES["sage"]["name"], callback_data="role_sage"),
+            InlineKeyboardButton(ROLES["ex"]["name"], callback_data="role_ex"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        "🤖 **Pawn Compiler Bot**\n\n"
-        "Отправьте мне `.pwn` файл, и я скомпилирую его в `.amx`\n\n"
-        "**Команды:**\n"
-        "/start - Запуск бота\n"
-        "/help - Помощь\n"
-        "/info - Информация",
-        parse_mode="Markdown"
+        f"{WELCOME_TEXT}\n\nСейчас я — {ROLES['sage']['name']}",
+        reply_markup=reply_markup,
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📚 **Как использовать:**\n\n"
-        "1️⃣ Отправьте файл с расширением `.pwn`\n"
-        "2️⃣ Бот скомпилирует его\n"
-        "3️⃣ Получите готовый `.amx` файл\n\n"
-        "⚠️ **Важно:**\n"
-        "• Максимальный размер файла: 20 MB\n"
-        "• Все include файлы должны быть на сервере",
-        parse_mode="Markdown"
-    )
 
-async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import shutil
-    compiler_exists = shutil.which(PAWNCC_PATH) is not None
-    
-    info_text = (
-        "ℹ️ **Информация:**\n\n"
-        f"**Компилятор Pawn:** {'✅ Доступен' if compiler_exists else '❌ Не найден'}\n"
-        f"**Путь:** `{PAWNCC_PATH}`\n"
-        "**Форматы:** .pwn → .amx\n"
-        f"**Активных пользователей:** {len(user_last_message)}"
-    )
-    
-    await update.message.reply_text(info_text, parse_mode="Markdown")
+async def change_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback-обработчик смены роли."""
+    query = update.callback_query
+    await query.answer()
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await anti_flood(update, context):
-        return
-    
-    document = update.message.document
-    
-    if not document.file_name or not document.file_name.lower().endswith('.pwn'):
-        await update.message.reply_text(
-            "❌ **Ошибка:** Отправьте файл с расширением `.pwn`",
-            parse_mode="Markdown"
+    user_id = query.from_user.id
+    role_key = query.data.split("_")[1]  # role_ham, role_sage, role_ex
+
+    if role_key in ROLES:
+        user_roles[user_id] = role_key
+        role_name = ROLES[role_key]["name"]
+        await query.edit_message_text(
+            text=f"✅ Роль изменена: теперь я — {role_name}\n\nЗадавай любой вопрос или отправляй фото!"
         )
-        return
+    else:
+        await query.edit_message_text("⚠️ Неизвестная роль, попробуй снова /start")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых сообщений."""
+    user_id = update.effective_user.id
+    user_text = update.message.text
+
+    role_key = user_roles.get(user_id, "sage")
+    system_prompt = ROLES[role_key]["prompt"]
+
+    # Отправляем статус "печатает"
+    await update.message.chat.send_action(action="typing")
+
+    response = gemini_request(user_text, system_prompt)
+    await update.message.reply_text(response[:4096])  # Telegram лимит 4096 символов
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фотографий — нейросеть видит детали."""
+    user_id = update.effective_user.id
+    role_key = user_roles.get(user_id, "sage")
+    system_prompt = ROLES[role_key]["prompt"] + " Опиши изображение в своём стиле."
+
+    # Получаем самое большое фото
+    photo_file = await update.message.photo[-1].get_file()
     
-    if document.file_size > 20 * 1024 * 1024:
-        await update.message.reply_text(
-            f"❌ **Файл слишком большой!**\nМаксимум: 20 MB",
-            parse_mode="Markdown"
-        )
-        return
-    
-    status_msg = await update.message.reply_text(
-        f"🔄 **Компиляция...**\nФайл: `{document.file_name}`",
-        parse_mode="Markdown"
-    )
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        work_dir = Path(tmpdir)
-        
-        try:
-            file = await context.bot.get_file(document.file_id)
-            pwn_path = work_dir / document.file_name
-            await file.download_to_drive(pwn_path)
-            
-            result = subprocess.run(
-                [PAWNCC_PATH, str(pwn_path), '-;+', '-\\+', '-(+', '-r'],
-                cwd=str(work_dir),
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            amx_path = pwn_path.with_suffix('.amx')
-            
-            if result.returncode == 0 and amx_path.exists() and amx_path.stat().st_size > 0:
-                await status_msg.delete()
-                
-                with open(amx_path, 'rb') as amx_file:
-                    output_name = pwn_path.stem + '.amx'
-                    await update.message.reply_document(
-                        document=amx_file,
-                        filename=output_name,
-                        caption=f"✅ **Компиляция успешна!**",
-                        parse_mode="Markdown"
-                    )
-            else:
-                error_msg = result.stderr if result.stderr else result.stdout
-                if not error_msg or error_msg.strip() == "":
-                    error_msg = "Неизвестная ошибка компиляции"
-                
-                if len(error_msg) > 1500:
-                    error_msg = error_msg[:1500] + "\n\n... (обрезано)"
-                
-                await status_msg.edit_text(
-                    f"❌ **Ошибка компиляции:**\n\n```\n{error_msg}\n```",
-                    parse_mode="Markdown"
-                )
-                
-        except subprocess.TimeoutExpired:
-            await status_msg.edit_text("⏰ **Ошибка:** Превышено время компиляции (30 секунд)", parse_mode="Markdown")
-        except FileNotFoundError:
-            await status_msg.edit_text(
-                f"❌ **Ошибка:** Компилятор не найден!\nПуть: `{PAWNCC_PATH}`",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            await status_msg.edit_text(f"❌ **Ошибка:** `{str(e)}`", parse_mode="Markdown")
+    # Скачиваем фото в память
+    image_bytes = BytesIO()
+    await photo_file.download_to_memory(image_bytes)
+    image_bytes.seek(0)
+
+    # Опционально сжимаем, если фото слишком большое
+    img = Image.open(image_bytes)
+    if img.size[0] > 1500 or img.size[1] > 1500:
+        img.thumbnail((1500, 1500))
+        buffer = BytesIO()
+        img.save(buffer, format="JPEG", quality=85)
+        image_bytes = buffer
+        image_bytes.seek(0)
+
+    # Конвертируем в base64 для Gemini
+    base64_image = base64.b64encode(image_bytes.getvalue()).decode('utf-8')
+
+    # Берём подпись к фото или стандартный вопрос
+    user_question = update.message.caption or "Что ты видишь на этом изображении? Опиши подробно."
+
+    await update.message.chat.send_action(action="upload_photo")
+
+    response = gemini_request(user_question, system_prompt, base64_image)
+    await update.message.reply_text(response[:4096])
+
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Ошибка: {context.error}")
+    """Глобальный обработчик ошибок."""
+    logger.error(f"Ошибка при обработке update {update}: {context.error}")
     if update and update.effective_message:
-        await update.effective_message.reply_text("⚠️ Произошла ошибка. Попробуйте позже.")
+        await update.effective_message.reply_text(
+            "⚠️ Произошла внутренняя ошибка. Попробуйте ещё раз или напишите /start"
+        )
+
 
 def main():
-    print("🚀 Запуск Pawn Compiler Bot...")
+    """Запуск бота."""
+    # Проверка зависимостей
+    try:
+        from PIL import Image
+    except ImportError:
+        print("⚠️ Установите Pillow: pip install Pillow")
+        return
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(change_role, pattern="^role_"))
+
+    # Обработчики сообщений
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Обработчик ошибок
+    app.add_error_handler(error_handler)
+
+    print("🤖 Бот DeepSeek (без голоса) запущен!")
+    print(f"Telegram токен: {TELEGRAM_TOKEN[:10]}...")
+    print("Доступные роли: Хам, Мудрец, Бывшая")
+    print("Поддерживается текст и фото")
     
-    import shutil
-    if shutil.which(PAWNCC_PATH):
-        print(f"✅ Компилятор найден: {shutil.which(PAWNCC_PATH)}")
-    else:
-        print(f"⚠️ Компилятор не найден: {PAWNCC_PATH}")
-    
-    application = Application.builder().token(TOKEN).build()
-    
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("info", info_command))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_error_handler(error_handler)
-    
-    print("✅ Бот успешно запущен!")
-    print(f"🤖 Имя бота: @uralpwn_bot")
-    
-    application.run_polling(drop_pending_updates=True)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
