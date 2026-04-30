@@ -52,7 +52,7 @@ def handle_text(message):
             bot.send_message(chat_id, "Профиль не найден. Попробуйте перезапустить бота с помощью /start")
     elif message.text == "💳 Пополнить баланс":
         markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("🤖USDT Crypto Bot", callback_data="pay_usdt"))
+        markup.add(types.InlineKeyboardButton("🤖 CryptoBot | USDT", callback_data="pay_usdt"))
         bot.send_message(chat_id, "➖ Пополнение баланса ➖\n\nВыберите способ пополнения баланса.", reply_markup=markup)
     elif message.text == "🏪 Купить":
         markup = types.InlineKeyboardMarkup()
@@ -72,8 +72,8 @@ def handle_text(message):
 def process_amount(message):
     try:
         amount = float(message.text)
-        if not (1 <= amount <= 1500):
-            raise ValueError("Сумма должна быть от 1$ до 1500$")
+        if not (0.0001 <= amount <= 500):
+            raise ValueError("Сумма должна быть от 0.0001$ до 500$")
         markup = types.InlineKeyboardMarkup()
         invoice = create_cryptobot_invoice(amount, message.from_user.id)
         markup.add(types.InlineKeyboardButton("🌍 Перейти к оплате", url=invoice['pay_url']))
