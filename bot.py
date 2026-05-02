@@ -2,11 +2,12 @@ import telebot
 from telebot import types
 from tinydb import TinyDB, Query
 import time
-import json
-import shutil
+import random
 from datetime import datetime
 from config import TOKEN, CHANNEL_ID, CHANNEL_LINK, ADMIN_CHANNEL_ID
 import os
+import shutil
+import json
 
 # Функция для удаления вебхука
 def delete_webhook():
@@ -14,13 +15,11 @@ def delete_webhook():
         bot_temp = telebot.TeleBot(TOKEN)
         bot_temp.remove_webhook()
         time.sleep(1)
-        print("✅ Вебхук успешно удалён")
-        return True
+        print("✅ Вебхук удалён")
     except Exception as e:
-        print(f"❌ Ошибка при удалении вебхука: {e}")
-        return False
+        print(f"Ошибка удаления вебхука: {e}")
 
-# Функция для создания бэкапа базы данных
+# Функция для бэкапа
 def backup_database():
     try:
         if os.path.exists('db.json'):
@@ -29,18 +28,12 @@ def backup_database():
             if not os.path.exists(backup_dir):
                 os.makedirs(backup_dir)
             shutil.copy('db.json', f'{backup_dir}/db_{timestamp}.json')
-            # Оставляем только последние 10 бэкапов
-            backups = sorted([f for f in os.listdir(backup_dir) if f.startswith('db_')])
-            while len(backups) > 10:
-                os.remove(f'{backup_dir}/{backups.pop(0)}')
-            print(f"✅ Создан бэкап: db_{timestamp}.json")
     except Exception as e:
-        print(f"❌ Ошибка создания бэкапа: {e}")
+        print(f"Ошибка бэкапа: {e}")
 
 def create_bot():
     global BOT_USERNAME 
     try:
-        # Сначала удаляем вебхук
         delete_webhook()
         
         bot = telebot.TeleBot(TOKEN)
@@ -49,9 +42,6 @@ def create_bot():
         bot_info = bot.get_me()
         BOT_USERNAME = bot_info.username
         print(f"🤖 Бот запущен: @{BOT_USERNAME}")
-
-        # Словарь для хранения временных данных ставки
-        temp_bets = {}
 
         @bot.message_handler(commands=['start'])
         def start_handler(message):
@@ -73,11 +63,13 @@ def create_bot():
                         'losses_count': 0,
                         'total_earned': 0,
                         'total_wagered': 0,
+                        'slots_played': 0,
+                        'slots_wins': 0,
                         'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         'first_name': first_name,
                         'last_name': last_name
                     })
-                    print(f"📝 Новый пользователь: {user_id} (@{username})")
+                    print(f"📝 Новый пользователь: {user_id}")
 
                 if param == "bet":
                     user_data = db.get(User.user_id == user_id)
@@ -89,122 +81,126 @@ def create_bot():
                                    parse_mode='HTML')
                     bot.register_next_step_handler(message, process_bet_amount)
                 else:
-                    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+                    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
                     btn_profile = types.KeyboardButton("⚡️ Профиль")
-                    btn_add_stars = types.KeyboardButton("💰 Пополнить звёзды")
-                    btn_withdraw = types.KeyboardButton("🎁 Вывести звёзды")
-                    btn_bet = types.KeyboardButton("🎲 Сделать ставку")
-                    markup.add(btn_profile, btn_add_stars)
-                    markup.add(btn_withdraw, btn_bet)
+                    btn_add_stars = types.KeyboardButton("💰 Пополнить")
+                    btn_withdraw = types.KeyboardButton("🎁 Вывести")
+                    btn_bet = types.KeyboardButton("🎲 Ставка")
+                    btn_slots = types.KeyboardButton("🎰 Слоты")
+                    markup.add(btn_profile, btn_add_stars, btn_withdraw, btn_bet, btn_slots)
                     
                     bot.send_message(message.chat.id,
                                    f"<b>👋 Добро пожаловать, @{username}</b>\n\n"
-                                   f"📢 Канал со ставками - <a href='{CHANNEL_LINK}'>тык</a>\n\n"
-                                   f"🎲 Играй в 'Больше' или 'Меньше' и выигрывай x2!",
+                                   f"📢 Канал: <a href='{CHANNEL_LINK}'>тык</a>\n\n"
+                                   f"🎲 Ставки - выигрыш x2\n"
+                                   f"🎰 Слоты - x2, x5, x10",
                                    parse_mode='HTML',
                                    reply_markup=markup)
             except Exception as e:
-                print(f"Ошибка в start_handler: {e}")
-                bot.send_message(message.chat.id, "❌ Произошла ошибка, попробуйте ещё раз")
+                print(f"Ошибка start: {e}")
+                bot.send_message(message.chat.id, "❌ Ошибка")
 
+        # ========== СТАВКИ ==========
         def process_bet_amount(message):
             try:
                 user_id = message.from_user.id
                 amount_text = message.text.strip()
                 
-                # Проверка на число
                 if not amount_text.isdigit():
-                    bot.send_message(message.chat.id, "❌ Пожалуйста, введите число!")
+                    bot.send_message(message.chat.id, "❌ Введите число!")
                     return
                     
                 amount = int(amount_text)
                 user_data = db.get(User.user_id == user_id)
                 
-                if amount <= 0:
-                    bot.send_message(message.chat.id, "❌ Сумма ставки должна быть больше нуля!")
-                    return
-                    
                 if amount < 5:
-                    bot.send_message(message.chat.id, "❌ Минимальная ставка: 5 звёзд!")
+                    bot.send_message(message.chat.id, "❌ Минимум 5 звёзд!")
                     return
                     
                 if amount > user_data['balance']:
-                    bot.send_message(message.chat.id, f"❌ Недостаточно звёзд! Ваш баланс: {user_data['balance']} звёзд")
+                    bot.send_message(message.chat.id, f"❌ Недостаточно! Баланс: {user_data['balance']}⭐")
                     return
                 
-                # Сохраняем сумму ставки во временный словарь
-                temp_bets[user_id] = amount
+                # Сохраняем ставку В БАЗУ ДАННЫХ
+                db.update({
+                    'temp_bet_amount': amount,
+                    'temp_bet_step': 'waiting_choice'
+                }, User.user_id == user_id)
                 
                 markup = types.InlineKeyboardMarkup(row_width=2)
-                btn_more = types.InlineKeyboardButton("🎲 БОЛЬШЕ (4-6)", callback_data=f"game_more")
-                btn_less = types.InlineKeyboardButton("🎲 МЕНЬШЕ (1-3)", callback_data=f"game_less")
+                btn_more = types.InlineKeyboardButton("🎲 БОЛЬШЕ (4-6)", callback_data="game_more")
+                btn_less = types.InlineKeyboardButton("🎲 МЕНЬШЕ (1-3)", callback_data="game_less")
                 markup.add(btn_more, btn_less)
                 
                 bot.send_message(message.chat.id,
-                               f"<b>🎲 Ставка: {amount} звёзд</b>\n\n"
-                               f"<b>Выберите исход:</b>\n"
-                               f"🔹 БОЛЬШЕ - выпадет 4, 5 или 6\n"
-                               f"🔹 МЕНЬШЕ - выпадет 1, 2 или 3",
+                               f"<b>🎲 Ставка: {amount}⭐</b>\n\n"
+                               f"<b>Выберите исход:</b>",
                                parse_mode='HTML',
                                reply_markup=markup)
             except Exception as e:
-                print(f"Ошибка в process_bet_amount: {e}")
-                bot.send_message(message.chat.id, "❌ Произошла ошибка при обработке ставки")
+                print(f"Ошибка process_bet: {e}")
+                bot.send_message(message.chat.id, "❌ Ошибка")
 
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("game_"))
+        @bot.callback_query_handler(func=lambda call: call.data in ["game_more", "game_less"])
         def game_choice(call):
             try:
                 user_id = call.from_user.id
-                game_type = call.data.split("_")[1]  # "more" или "less"
+                game_type = call.data.split("_")[1]
                 
-                if user_id not in temp_bets:
-                    bot.answer_callback_query(call.id, "❌ Ставка не найдена, начните заново")
+                user_data = db.get(User.user_id == user_id)
+                
+                # Проверяем есть ли временная ставка
+                if 'temp_bet_amount' not in user_data or user_data.get('temp_bet_step') != 'waiting_choice':
+                    bot.answer_callback_query(call.id, "❌ Ставка не найдена. Начните заново /start bet")
                     return
                 
-                amount = temp_bets[user_id]
+                amount = user_data['temp_bet_amount']
+                
+                # Сохраняем выбор
+                db.update({
+                    'temp_bet_choice': game_type,
+                    'temp_bet_step': 'waiting_confirm'
+                }, User.user_id == user_id)
                 
                 markup = types.InlineKeyboardMarkup()
-                btn_yes = types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"confirm_{game_type}")
-                btn_cancel = types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_game")
-                markup.add(btn_yes, btn_cancel)
+                btn_yes = types.InlineKeyboardButton("✅ Да", callback_data="confirm_bet")
+                btn_no = types.InlineKeyboardButton("❌ Нет", callback_data="cancel_bet")
+                markup.add(btn_yes, btn_no)
                 
-                game_text = "БОЛЬШЕ (4-6)" if game_type == "more" else "МЕНЬШЕ (1-3)"
+                game_text = "БОЛЬШЕ" if game_type == "more" else "МЕНЬШЕ"
                 
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text=f"<b>🎲 Подтверждение ставки</b>\n\n"
-                         f"💰 Сумма: {amount} звёзд\n"
+                    text=f"<b>🎲 Подтверждение</b>\n\n"
+                         f"💰 Сумма: {amount}⭐\n"
                          f"🎯 Исход: {game_text}\n\n"
-                         f"<b>Подтверждаете?</b>",
+                         f"Подтверждаете?",
                     parse_mode='HTML',
                     reply_markup=markup
                 )
             except Exception as e:
-                print(f"Ошибка в game_choice: {e}")
-                bot.answer_callback_query(call.id, "❌ Произошла ошибка")
+                print(f"Ошибка game_choice: {e}")
+                bot.answer_callback_query(call.id, "❌ Ошибка")
 
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_"))
+        @bot.callback_query_handler(func=lambda call: call.data == "confirm_bet")
         def confirm_game(call):
             try:
                 user_id = call.from_user.id
-                game_type = call.data.split("_")[1]  # "more" или "less"
-                
-                if user_id not in temp_bets:
-                    bot.answer_callback_query(call.id, "❌ Ставка не найдена")
-                    return
-                
-                amount = temp_bets.pop(user_id)
                 username = call.from_user.username or "NoUsername"
                 user_data = db.get(User.user_id == user_id)
                 
-                # Проверяем баланс ещё раз
+                if 'temp_bet_amount' not in user_data or user_data.get('temp_bet_step') != 'waiting_confirm':
+                    bot.answer_callback_query(call.id, "❌ Ставка не найдена!")
+                    return
+                
+                amount = user_data['temp_bet_amount']
+                game_type = user_data['temp_bet_choice']
+                
+                # Проверяем баланс
                 if user_data['balance'] < amount:
-                    bot.edit_message_text(
-                        chat_id=call.message.chat.id,
-                        message_id=call.message.message_id,
-                        text="❌ Недостаточно средств для ставки!"
-                    )
+                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="❌ Недостаточно средств!")
+                    db.update({'temp_bet_step': None}, User.user_id == user_id)
                     return
                 
                 # Списываем ставку
@@ -213,31 +209,25 @@ def create_bot():
                 new_total_wagered = user_data['total_wagered'] + amount
                 
                 db.update({
-                    'balance': new_balance, 
+                    'balance': new_balance,
                     'bets_count': new_bets_count,
-                    'total_wagered': new_total_wagered
+                    'total_wagered': new_total_wagered,
+                    'temp_bet_step': 'playing'
                 }, User.user_id == user_id)
                 
-                # Сообщение о начале игры
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text=f"🎲 <b>Игра началась!</b>\n\n"
-                         f"Ставка: {amount} звёзд\n"
-                         f"Исход: {'БОЛЬШЕ' if game_type == 'more' else 'МЕНЬШЕ'}\n\n"
-                         f"🎲 Бросаем кубик...",
+                    text=f"🎲 <b>Игра!</b>\n\nСтавка: {amount}⭐\n🎲 Бросаем кубик...",
                     parse_mode='HTML'
                 )
                 
-                # Отправляем анимацию кубика
                 time.sleep(1)
                 dice = bot.send_dice(call.message.chat.id)
                 dice_value = dice.dice.value
                 
-                # Определяем победу
                 win = (game_type == "more" and dice_value >= 4) or (game_type == "less" and dice_value <= 3)
-                
-                game_text = "БОЛЬШЕ (4-6)" if game_type == "more" else "МЕНЬШЕ (1-3)"
+                game_text = "БОЛЬШЕ" if game_type == "more" else "МЕНЬШЕ"
                 
                 if win:
                     win_amount = amount * 2
@@ -249,74 +239,41 @@ def create_bot():
                     db.update({
                         'balance': new_balance,
                         'total_earned': new_total_earned,
-                        'wins_count': new_wins
+                        'wins_count': new_wins,
+                        'temp_bet_step': None
                     }, User.user_id == user_id)
                     
-                    bot.send_message(
-                        call.message.chat.id,
+                    bot.send_message(call.message.chat.id,
                         f"<b>🎉 ПОБЕДА!</b>\n\n"
-                        f"🎲 Выпало значение: <b>{dice_value}</b>\n"
-                        f"🎯 Ваш выбор: {game_text}\n\n"
-                        f"💰 Вы выиграли: <b>{win_amount} звёзд</b>\n"
-                        f"💎 Новый баланс: <b>{new_balance} звёзд</b>",
-                        parse_mode='HTML'
-                    )
-                    
-                    # Отправляем в канал
-                    try:
-                        markup = types.InlineKeyboardMarkup()
-                        bet_button = types.InlineKeyboardButton("🎲 Сделать ставку", url=f"https://t.me/{BOT_USERNAME}?start=bet")
-                        markup.add(bet_button)
-                        
-                        bot.send_message(
-                            CHANNEL_ID,
-                            f"<b>🎉 ПОБЕДА!</b>\n\n"
-                            f"👤 Игрок: @{username}\n"
-                            f"🎲 Выпало: {dice_value}\n"
-                            f"💰 Выигрыш: {win_amount} звёзд",
-                            parse_mode='HTML',
-                            reply_markup=markup
-                        )
-                    except:
-                        pass
-                        
+                        f"🎲 Выпало: {dice_value}\n"
+                        f"🎯 Выбор: {game_text}\n\n"
+                        f"💰 Выигрыш: {win_amount}⭐\n"
+                        f"💎 Баланс: {new_balance}⭐",
+                        parse_mode='HTML')
                 else:
                     new_losses = user_data['losses_count'] + 1
-                    db.update({'losses_count': new_losses}, User.user_id == user_id)
+                    db.update({
+                        'losses_count': new_losses,
+                        'temp_bet_step': None
+                    }, User.user_id == user_id)
                     
-                    bot.send_message(
-                        call.message.chat.id,
+                    bot.send_message(call.message.chat.id,
                         f"<b>😞 ПРОИГРЫШ</b>\n\n"
-                        f"🎲 Выпало значение: <b>{dice_value}</b>\n"
-                        f"🎯 Ваш выбор: {game_text}\n\n"
-                        f"💔 Вы проиграли {amount} звёзд\n"
-                        f"💎 Новый баланс: <b>{user_data['balance'] - amount}</b>",
-                        parse_mode='HTML'
-                    )
-                    
-                    # Отправляем в канал
-                    try:
-                        bot.send_message(
-                            CHANNEL_ID,
-                            f"<b>😞 ПРОИГРЫШ</b>\n\n"
-                            f"👤 Игрок: @{username}\n"
-                            f"🎲 Выпало: {dice_value}\n"
-                            f"💔 Проигрыш: {amount} звёзд",
-                            parse_mode='HTML'
-                        )
-                    except:
-                        pass
+                        f"🎲 Выпало: {dice_value}\n"
+                        f"🎯 Выбор: {game_text}\n\n"
+                        f"💔 Проигрыш: {amount}⭐\n"
+                        f"💎 Баланс: {user_data['balance'] - amount}⭐",
+                        parse_mode='HTML')
                         
             except Exception as e:
-                print(f"Ошибка в confirm_game: {e}")
-                bot.send_message(call.message.chat.id, "❌ Произошла ошибка во время игры")
+                print(f"Ошибка confirm_game: {e}")
+                bot.send_message(call.message.chat.id, "❌ Ошибка")
 
-        @bot.callback_query_handler(func=lambda call: call.data == "cancel_game")
+        @bot.callback_query_handler(func=lambda call: call.data == "cancel_bet")
         def cancel_game(call):
             try:
                 user_id = call.from_user.id
-                if user_id in temp_bets:
-                    del temp_bets[user_id]
+                db.update({'temp_bet_step': None}, User.user_id == user_id)
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
@@ -325,19 +282,130 @@ def create_bot():
             except Exception as e:
                 pass
 
-        @bot.message_handler(func=lambda message: message.text == "🎲 Сделать ставку")
-        def make_bet_handler(message):
-            user_id = message.from_user.id
-            user_data = db.get(User.user_id == user_id)
-            bot.send_message(message.chat.id,
-                           f"<b>🎲 Сделать ставку</b>\n\n"
-                           f"💰 Ваш баланс: <code>{user_data['balance']} звёзд</code>\n\n"
-                           f"<b>Пришлите сумму звёзд для ставки.</b>\n"
-                           f"<i>Минимальная ставка: 5 звёзд</i>\n"
-                           f"<i>Выигрыш: x2 от ставки</i>",
-                           parse_mode='HTML')
-            bot.register_next_step_handler(message, process_bet_amount)
+        # ========== СЛОТЫ ==========
+        @bot.message_handler(func=lambda message: message.text == "🎰 Слоты")
+        def slots_handler(message):
+            try:
+                user_id = message.from_user.id
+                user_data = db.get(User.user_id == user_id)
+                
+                markup = types.InlineKeyboardMarkup(row_width=3)
+                buttons = [
+                    types.InlineKeyboardButton("10⭐", callback_data="slot_10"),
+                    types.InlineKeyboardButton("25⭐", callback_data="slot_25"),
+                    types.InlineKeyboardButton("50⭐", callback_data="slot_50"),
+                    types.InlineKeyboardButton("100⭐", callback_data="slot_100"),
+                    types.InlineKeyboardButton("250⭐", callback_data="slot_250"),
+                    types.InlineKeyboardButton("500⭐", callback_data="slot_500")
+                ]
+                markup.add(*buttons)
+                
+                bot.send_message(message.chat.id,
+                    f"<b>🎰 СЛОТЫ</b>\n\n"
+                    f"💰 Баланс: {user_data['balance']}⭐\n\n"
+                    f"<b>Выберите ставку:</b>\n"
+                    f"🎁 Выигрыши: x2, x5, x10\n"
+                    f"🎲 3 кубика - комбинации дают множитель!",
+                    parse_mode='HTML',
+                    reply_markup=markup)
+            except Exception as e:
+                print(f"Ошибка slots: {e}")
 
+        @bot.callback_query_handler(func=lambda call: call.data.startswith("slot_"))
+        def play_slots(call):
+            try:
+                user_id = call.from_user.id
+                bet = int(call.data.split("_")[1])
+                username = call.from_user.username or "NoUsername"
+                user_data = db.get(User.user_id == user_id)
+                
+                if user_data['balance'] < bet:
+                    bot.answer_callback_query(call.id, "❌ Недостаточно звёзд!")
+                    return
+                
+                # Списываем ставку
+                new_balance = user_data['balance'] - bet
+                new_slots_played = user_data.get('slots_played', 0) + 1
+                
+                db.update({
+                    'balance': new_balance,
+                    'slots_played': new_slots_played,
+                    'total_wagered': user_data['total_wagered'] + bet
+                }, User.user_id == user_id)
+                
+                # Сообщение о начале
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text=f"🎰 <b>СЛОТЫ</b>\n\nСтавка: {bet}⭐\n🎲 Крутим барабаны...",
+                    parse_mode='HTML'
+                )
+                
+                time.sleep(1)
+                
+                # Бросаем 3 кубика
+                dice1 = bot.send_dice(call.message.chat.id)
+                time.sleep(0.5)
+                dice2 = bot.send_dice(call.message.chat.id)
+                time.sleep(0.5)
+                dice3 = bot.send_dice(call.message.chat.id)
+                
+                val1 = dice1.dice.value
+                val2 = dice2.dice.value
+                val3 = dice3.dice.value
+                
+                # Определяем множитель
+                multiplier = 1
+                if val1 == val2 == val3:
+                    # Три одинаковых
+                    if val1 == 6:
+                        multiplier = 10  # Джекпот
+                    elif val1 in [5, 4]:
+                        multiplier = 5
+                    else:
+                        multiplier = 3
+                elif val1 == val2 or val2 == val3 or val1 == val3:
+                    multiplier = 2
+                
+                win_amount = bet * multiplier
+                
+                if multiplier > 1:
+                    user_data = db.get(User.user_id == user_id)
+                    new_balance = user_data['balance'] + win_amount
+                    new_slots_wins = user_data.get('slots_wins', 0) + 1
+                    new_total_earned = user_data['total_earned'] + win_amount
+                    
+                    db.update({
+                        'balance': new_balance,
+                        'slots_wins': new_slots_wins,
+                        'total_earned': new_total_earned
+                    }, User.user_id == user_id)
+                    
+                    # Эмодзи для кубиков
+                    emoji_map = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
+                    
+                    bot.send_message(call.message.chat.id,
+                        f"<b>🎉 ПОБЕДА В СЛОТАХ!</b>\n\n"
+                        f"🎲 {emoji_map[val1]} {emoji_map[val2]} {emoji_map[val3]}\n\n"
+                        f"⭐ Множитель: <b>x{multiplier}</b>\n"
+                        f"💰 Выигрыш: <b>{win_amount}⭐</b>\n"
+                        f"💎 Баланс: <b>{new_balance}⭐</b>",
+                        parse_mode='HTML')
+                else:
+                    emoji_map = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
+                    
+                    bot.send_message(call.message.chat.id,
+                        f"<b>😞 ПРОИГРЫШ В СЛОТАХ</b>\n\n"
+                        f"🎲 {emoji_map[val1]} {emoji_map[val2]} {emoji_map[val3]}\n\n"
+                        f"💔 Проигрыш: {bet}⭐\n"
+                        f"💎 Баланс: <b>{user_data['balance'] - bet}⭐</b>",
+                        parse_mode='HTML')
+                        
+            except Exception as e:
+                print(f"Ошибка play_slots: {e}")
+                bot.send_message(call.message.chat.id, "❌ Ошибка в слотах")
+
+        # ========== ПРОФИЛЬ ==========
         @bot.message_handler(func=lambda message: message.text == "⚡️ Профиль")
         def profile_handler(message):
             try:
@@ -349,38 +417,44 @@ def create_bot():
                 if user_data['bets_count'] > 0:
                     winrate = (user_data['wins_count'] / user_data['bets_count']) * 100
                 
+                slots_winrate = 0
+                if user_data.get('slots_played', 0) > 0:
+                    slots_winrate = (user_data.get('slots_wins', 0) / user_data['slots_played']) * 100
+                
                 text = "🎲 <b>📊 ПРОФИЛЬ</b>\n"
                 text += "═" * 20 + "\n"
                 text += f"🆔 ID: <code>{user_id}</code>\n"
-                text += f"👤 Ник: <code>@{username}</code>\n"
-                text += f"💎 Имя: <code>{user_data['first_name']}</code>\n\n"
+                text += f"👤 Юзер: <code>@{username}</code>\n\n"
                 text += "💰 <b>БАЛАНС</b>\n"
-                text += f"⭐️ Баланс: <code>{user_data['balance']} звёзд</code>\n\n"
-                text += "📈 <b>СТАТИСТИКА</b>\n"
-                text += f"🎲 Всего ставок: <code>{user_data['bets_count']}</code>\n"
-                text += f"✅ Побед: <code>{user_data['wins_count']}</code>\n"
-                text += f"❌ Поражений: <code>{user_data['losses_count']}</code>\n"
-                text += f"📊 Винрейт: <code>{winrate:.1f}%</code>\n"
-                text += f"💸 Выиграно всего: <code>{user_data['total_earned']} звёзд</code>\n"
-                text += f"🎲 Поставлено всего: <code>{user_data['total_wagered']} звёзд</code>\n\n"
-                text += f"📅 Регистрация: <code>{user_data['reg_date']}</code>"
+                text += f"⭐️ {user_data['balance']} звёзд\n\n"
+                text += "🎲 <b>СТАВКИ</b>\n"
+                text += f"📊 Всего: {user_data['bets_count']}\n"
+                text += f"✅ Побед: {user_data['wins_count']}\n"
+                text += f"❌ Поражений: {user_data['losses_count']}\n"
+                text += f"📈 Винрейт: {winrate:.1f}%\n"
+                text += f"💸 Выиграно: {user_data['total_earned']}⭐\n"
+                text += f"🎲 Поставлено: {user_data['total_wagered']}⭐\n\n"
+                text += "🎰 <b>СЛОТЫ</b>\n"
+                text += f"🎲 Игр: {user_data.get('slots_played', 0)}\n"
+                text += f"✅ Побед: {user_data.get('slots_wins', 0)}\n"
+                text += f"📈 Винрейт: {slots_winrate:.1f}%\n\n"
+                text += f"📅 Рег: {user_data['reg_date']}"
                 
                 bot.send_message(message.chat.id, text, parse_mode='HTML')
             except Exception as e:
-                print(f"Ошибка в profile_handler: {e}")
-                bot.send_message(message.chat.id, "❌ Ошибка при загрузке профиля")
+                print(f"Ошибка profile: {e}")
+                bot.send_message(message.chat.id, "❌ Ошибка")
 
-        @bot.message_handler(func=lambda message: message.text == "💰 Пополнить звёзды")
+        # ========== ПОПОЛНЕНИЕ ==========
+        @bot.message_handler(func=lambda message: message.text == "💰 Пополнить")
         def add_stars_handler(message):
             try:
                 bot.send_message(message.chat.id,
-                               "<b>💰 Пополнение баланса</b>\n\n"
-                               "Введите количество звёзд для пополнения:\n"
-                               "<i>Минимальная сумма: 1 звезда</i>",
+                               "<b>💰 Пополнение</b>\n\nВведите количество звёзд:",
                                parse_mode='HTML')
                 bot.register_next_step_handler(message, process_payment_amount)
             except Exception as e:
-                print(f"Ошибка в add_stars_handler: {e}")
+                print(f"Ошибка add: {e}")
 
         def process_payment_amount(message):
             try:
@@ -391,8 +465,8 @@ def create_bot():
                     return
                 bot.send_invoice(
                     chat_id=message.chat.id,
-                    title="⭐️ Пополнение звёзд",
-                    description=f"Пополнение баланса на {amount} звёзд",
+                    title="⭐️ Пополнение",
+                    description=f"Пополнение на {amount} звёзд",
                     invoice_payload=f"payment_{user_id}_{amount}",
                     provider_token="",
                     currency="XTR",
@@ -401,16 +475,14 @@ def create_bot():
             except ValueError:
                 bot.send_message(message.chat.id, "❌ Введите число!")
             except Exception as e:
-                print(f"Ошибка в process_payment_amount: {e}")
-                bot.send_message(message.chat.id, "❌ Ошибка при создании платежа")
+                print(f"Ошибка payment: {e}")
 
         @bot.pre_checkout_query_handler(func=lambda query: True)
         def process_pre_checkout_query(pre_checkout_query):
             try:
                 bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-                print(f"✅ Платёж одобрен: {pre_checkout_query.id}")
             except Exception as e:
-                print(f"Ошибка в pre_checkout: {e}")
+                print(f"Ошибка pre_checkout: {e}")
 
         @bot.message_handler(content_types=['successful_payment'])
         def process_successful_payment(message):
@@ -420,18 +492,12 @@ def create_bot():
                 user_data = db.get(User.user_id == user_id)
                 new_balance = user_data['balance'] + amount
                 db.update({'balance': new_balance}, User.user_id == user_id)
-                bot.send_message(
-                    message.chat.id, 
-                    f"<b>✅ Пополнение успешно!</b>\n\n"
-                    f"⭐️ Зачислено: {amount} звёзд\n"
-                    f"💰 Новый баланс: {new_balance} звёзд",
-                    parse_mode='HTML'
-                )
-                print(f"💰 Пользователь {user_id} пополнил {amount} звёзд")
+                bot.send_message(message.chat.id, f"<b>✅ Пополнено!</b>\n\n⭐ {amount} звёзд\n💰 Новый баланс: {new_balance}⭐", parse_mode='HTML')
             except Exception as e:
-                print(f"Ошибка в successful_payment: {e}")
+                print(f"Ошибка success: {e}")
 
-        @bot.message_handler(func=lambda message: message.text == "🎁 Вывести звёзды")
+        # ========== ВЫВОД ==========
+        @bot.message_handler(func=lambda message: message.text == "🎁 Вывести")
         def withdraw_stars_handler(message):
             try:
                 user_id = message.from_user.id
@@ -439,54 +505,44 @@ def create_bot():
                 balance = user_data['balance']
                 
                 if balance < 15:
-                    bot.send_message(message.chat.id, "❌ Минимальная сумма вывода: 15 звёзд")
+                    bot.send_message(message.chat.id, "❌ Минимум 15 звёзд")
                     return
                 
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 buttons = []
-                withdraw_amounts = [15, 25, 50, 100, 150, 350, 500]
-                for amt in withdraw_amounts:
+                for amt in [15, 25, 50, 100, 150, 350, 500]:
                     if balance >= amt:
-                        buttons.append(types.InlineKeyboardButton(f"{amt}⭐️", callback_data=f"withdraw_{amt}"))
+                        buttons.append(types.InlineKeyboardButton(f"{amt}⭐", callback_data=f"withdraw_{amt}"))
                 markup.add(*buttons)
                 
                 bot.send_message(message.chat.id,
-                               f"<b>🎁 Вывод звёзд</b>\n\n"
-                               f"💰 Баланс: <code>{balance} звёзд</code>\n\n"
-                               f"<b>Выберите сумму для вывода:</b>",
+                               f"<b>🎁 Вывод</b>\n\n💰 Баланс: {balance}⭐\n\nВыберите сумму:",
                                parse_mode='HTML',
                                reply_markup=markup)
             except Exception as e:
-                print(f"Ошибка в withdraw_stars_handler: {e}")
-                bot.send_message(message.chat.id, "❌ Произошла ошибка")
+                print(f"Ошибка withdraw: {e}")
 
         @bot.callback_query_handler(func=lambda call: call.data.startswith("withdraw_"))
         def withdraw_amount_choice(call):
             try:
                 user_id = call.from_user.id
                 count = int(call.data.split("_")[1])
-                user_data = db.get(User.user_id == user_id)
-                
-                if user_data['balance'] < count:
-                    bot.answer_callback_query(call.id, "❌ Недостаточно звёзд!")
-                    return
                 
                 markup = types.InlineKeyboardMarkup()
-                btn_yes = types.InlineKeyboardButton("✅ Да", callback_data=f"confirm_withdraw_{count}")
-                btn_no = types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_withdraw")
-                markup.add(btn_yes, btn_no)
+                markup.add(
+                    types.InlineKeyboardButton("✅ Да", callback_data=f"confirm_withdraw_{count}"),
+                    types.InlineKeyboardButton("❌ Нет", callback_data="cancel_withdraw")
+                )
                 
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text=f"<b>🎁 Подтверждение вывода</b>\n\n"
-                         f"Вы хотите вывести {count} звёзд?\n"
-                         f"<i>Заявка будет обработана в течение 72 часов</i>",
+                    text=f"<b>🎁 Подтверждение</b>\n\nВывести {count} звёзд?",
                     parse_mode='HTML',
                     reply_markup=markup
                 )
             except Exception as e:
-                print(f"Ошибка в withdraw_amount_choice: {e}")
+                print(f"Ошибка withdraw_choice: {e}")
 
         @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_withdraw_"))
         def confirm_withdraw(call):
@@ -496,34 +552,32 @@ def create_bot():
                 user_data = db.get(User.user_id == user_id)
                 username = call.from_user.username or "NoUsername"
                 
+                if user_data['balance'] < count:
+                    bot.answer_callback_query(call.id, "❌ Недостаточно!")
+                    return
+                
                 new_balance = user_data['balance'] - count
                 db.update({'balance': new_balance}, User.user_id == user_id)
                 
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text=f"<b>✅ Заявка на вывод отправлена!</b>\n\n"
-                         f"⭐️ Сумма: {count} звёзд\n"
-                         f"⏱ Ожидайте обработки в течение 72 часов",
+                    text=f"<b>✅ Заявка отправлена!</b>\n\n⭐ {count} звёзд\n⏱ Ожидайте 72 часа",
                     parse_mode='HTML'
                 )
                 
+                # Отправляем админу
                 markup = types.InlineKeyboardMarkup()
-                btn_issued = types.InlineKeyboardButton("✅ Выдано", callback_data=f"issued_{user_id}_{count}")
-                markup.add(btn_issued)
+                markup.add(types.InlineKeyboardButton("✅ Выдано", callback_data=f"issued_{user_id}_{count}"))
                 
                 bot.send_message(
                     ADMIN_CHANNEL_ID,
-                    f"<b>📝 НОВАЯ ЗАЯВКА НА ВЫВОД</b>\n\n"
-                    f"👤 Пользователь: @{username}\n"
-                    f"🆔 ID: {user_id}\n"
-                    f"⭐️ Сумма: {count} звёзд",
+                    f"<b>📝 НОВАЯ ЗАЯВКА</b>\n\n👤 @{username}\n🆔 {user_id}\n⭐ {count} звёзд",
                     parse_mode='HTML',
                     reply_markup=markup
                 )
-                print(f"📝 Заявка на вывод: {user_id} - {count} звёзд")
             except Exception as e:
-                print(f"Ошибка в confirm_withdraw: {e}")
+                print(f"Ошибка confirm_withdraw: {e}")
 
         @bot.callback_query_handler(func=lambda call: call.data == "cancel_withdraw")
         def cancel_withdraw(call):
@@ -545,63 +599,47 @@ def create_bot():
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
                     message_id=call.message.message_id,
-                    text=f"<b>✅ ЗАЯВКА ВЫПОЛНЕНА</b>\n\n"
-                         f"👤 ID: {user_id}\n"
-                         f"⭐️ Сумма: {count} звёзд\n\n"
-                         f"<b>Статус: Выдано ✅</b>",
+                    text=call.message.text + "\n\n✅ ВЫДАНО",
                     parse_mode='HTML'
                 )
                 
-                bot.send_message(
-                    user_id,
-                    f"<b>✅ Ваша заявка на вывод {count} звёзд выполнена!</b>\n\n"
-                    f"Ожидайте подарок от администратора.",
-                    parse_mode='HTML'
-                )
-                bot.answer_callback_query(call.id, "Заявка отмечена как выполненная")
+                bot.send_message(user_id, f"<b>✅ Заявка на вывод {count}⭐ выполнена!</b>", parse_mode='HTML')
             except Exception as e:
-                print(f"Ошибка в issue_withdraw: {e}")
+                print(f"Ошибка issued: {e}")
 
-        # Делаем бэкап каждые 100 сообщений (примерно)
-        message_counter = 0
-        
-        @bot.message_handler(func=lambda message: True)
-        def count_messages(message):
-            nonlocal message_counter
-            message_counter += 1
-            if message_counter >= 100:
-                message_counter = 0
-                backup_database()
+        # ========== КНОПКА СТАВКА ==========
+        @bot.message_handler(func=lambda message: message.text == "🎲 Ставка")
+        def bet_button_handler(message):
+            user_id = message.from_user.id
+            user_data = db.get(User.user_id == user_id)
+            bot.send_message(message.chat.id,
+                           f"<b>🎲 СТАВКА</b>\n\n💰 Баланс: {user_data['balance']}⭐\n\nВведите сумму (мин 5⭐):",
+                           parse_mode='HTML')
+            bot.register_next_step_handler(message, process_bet_amount)
 
         return bot
 
     except Exception as e:
-        print(f"Ошибка в create_bot: {e}")
+        print(f"Ошибка create_bot: {e}")
         return None
 
 def run_bot():
-    global BOT_USERNAME  
     while True:
         try:
-            # При каждом запуске удаляем вебхук
             delete_webhook()
-            
             bot = create_bot()
             if bot is None:
                 raise Exception("Не удалось создать бота")
             
-            print("🚀 Бот запущен и работает...")
-            backup_database()  # Создаём бэкап при старте
-            
-            # Запускаем polling с явным удалением вебхука
+            print("🚀 Бот запущен!")
+            backup_database()
             bot.polling(none_stop=True, timeout=60, skip_pending=True)
             
         except Exception as e:
-            print(f"❌ Ошибка: {str(e)}")
+            print(f"❌ Ошибка: {e}")
             print("🔄 Перезапуск через 5 секунд...")
             time.sleep(5)
-            continue
 
 if __name__ == "__main__":
-    print("🎲 Бот для ставок 'Больше/Меньше' запускается...")
+    print("🎲 Бот запускается...")
     run_bot()
