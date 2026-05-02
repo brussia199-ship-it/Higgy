@@ -1,645 +1,665 @@
-import telebot
-from telebot import types
-from tinydb import TinyDB, Query
-import time
-import random
-from datetime import datetime
-from config import TOKEN, CHANNEL_ID, CHANNEL_LINK, ADMIN_CHANNEL_ID
+import asyncio
+import sqlite3
 import os
-import shutil
-import json
+from datetime import datetime
+from typing import Optional, Tuple
 
-# Функция для удаления вебхука
-def delete_webhook():
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter  # ← ДОБАВЛЕН StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# ================= КОНФИГУРАЦИЯ =================
+BOT_TOKEN = "8655931539:AAE9DjvBYScMBrutC17TP0UaLBc_jj_bo2U"  # Замените на ваш токен от @BotFather
+ADMIN_IDS = [7673683792]  # ID администраторов (укажите свои)
+STAR_PRICE = 500  # Стоимость удаления в звёздах Telegram
+
+# ================= СОСТОЯНИЯ FSM =================
+class ReportStates(StatesGroup):
+    waiting_for_username = State()
+    waiting_for_proof_photos = State()
+    waiting_for_proof_videos = State()
+
+class AdminAddStates(StatesGroup):
+    waiting_for_username = State()
+    waiting_for_label = State()
+
+class AdminRemoveStates(StatesGroup):
+    waiting_for_username = State()
+
+# ================= ИНИЦИАЛИЗАЦИЯ =================
+bot = Bot(token=BOT_TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+
+# ================= РАБОТА С БАЗОЙ ДАННЫХ =================
+def init_db():
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS scambase (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            label TEXT DEFAULT 'Scammer',
+            added_by INTEGER,
+            added_date TEXT,
+            proof_photos TEXT DEFAULT '',
+            proof_videos TEXT DEFAULT ''
+        )
+    ''')
+    
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            reported_by INTEGER,
+            proof_photos TEXT,
+            proof_videos TEXT,
+            status TEXT DEFAULT 'pending',
+            report_date TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+
+def is_in_scambase(username: str) -> Optional[str]:
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('SELECT label FROM scambase WHERE username = ?', (username,))
+    result = cur.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+
+def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str = '', proof_videos: str = '') -> bool:
     try:
-        bot_temp = telebot.TeleBot(TOKEN)
-        bot_temp.remove_webhook()
-        time.sleep(1)
-        print("✅ Вебхук удалён")
-    except Exception as e:
-        print(f"Ошибка удаления вебхука: {e}")
+        conn = sqlite3.connect('scambase.db')
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO scambase (username, label, added_by, added_date, proof_photos, proof_videos)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (username, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
 
-# Функция для бэкапа
-def backup_database():
+
+def remove_from_scambase(username: str) -> bool:
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('DELETE FROM scambase WHERE username = ?', (username,))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return deleted
+
+
+def update_label(username: str, new_label: str) -> bool:
+    if new_label not in ['Scammer', 'Face', 'Worker']:
+        return False
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('UPDATE scambase SET label = ? WHERE username = ?', (new_label, username))
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('''
+        INSERT INTO reports (username, reported_by, proof_photos, proof_videos, status, report_date)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (username, user_id, ','.join(photos), ','.join(videos), 'pending', datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_pending_reports() -> list:
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('SELECT id, username, reported_by, proof_photos, proof_videos, report_date FROM reports WHERE status = "pending"')
+    results = cur.fetchall()
+    conn.close()
+    return results
+
+
+def approve_report(report_id: int, username: str, label: str, admin_id: int):
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('UPDATE reports SET status = "approved" WHERE id = ?', (report_id,))
+    cur.execute('''
+        INSERT OR IGNORE INTO scambase (username, label, added_by, added_date)
+        VALUES (?, ?, ?, ?)
+    ''', (username, label, admin_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def reject_report(report_id: int):
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    cur.execute('UPDATE reports SET status = "rejected" WHERE id = ?', (report_id,))
+    conn.commit()
+    conn.close()
+
+
+# ================= КЛАВИАТУРЫ =================
+def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔍 Поиск в ScamBase", callback_data="search")
+    builder.button(text="⭐ Удалить себя (500 ⭐)", callback_data="delete_self")
+    builder.button(text="📝 Подать заявку на скаммера", callback_data="report")
+    builder.button(text="📊 Статистика", callback_data="stats")
+    
+    if is_admin_user:
+        builder.button(text="👑 Админ-панель", callback_data="admin_panel")
+    
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить в базу", callback_data="admin_add")
+    builder.button(text="❌ Удалить из базы", callback_data="admin_remove")
+    builder.button(text="🏷️ Выдать метку", callback_data="admin_label")
+    builder.button(text="📋 Заявки от пользователей", callback_data="admin_reports")
+    builder.button(text="🔙 Назад", callback_data="back_to_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def label_keyboard(username: str, action: str = "add") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔴 Scammer", callback_data=f"{action}_label_{username}_Scammer")
+    builder.button(text="🟡 Face", callback_data=f"{action}_label_{username}_Face")
+    builder.button(text="🟢 Worker", callback_data=f"{action}_label_{username}_Worker")
+    builder.button(text="🔙 Отмена", callback_data="admin_panel")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+# ================= ОБЩИЕ ХЕНДЛЕРЫ =================
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    is_admin_user = message.from_user.id in ADMIN_IDS
+    await message.answer(
+        "👋 Добро пожаловать в ScamBase Bot!\n\n"
+        "🔍 Я помогу проверить, есть ли человек в базе скамеров.\n"
+        "📝 Также ты можешь подать заявку на добавление скамера с доказательствами.\n\n"
+        "Используй кнопки ниже для навигации:",
+        reply_markup=main_menu_keyboard(is_admin_user)
+    )
+
+
+@dp.callback_query(F.data == "search")
+async def search_prompt(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔍 Введите username человека для проверки (без @):")
+    await callback.answer()
+    await state.set_state("waiting_for_search")
+
+
+@dp.message(StateFilter("waiting_for_search"))
+async def perform_search(message: Message, state: FSMContext):
+    username = message.text.strip().replace('@', '')
+    label = is_in_scambase(username)
+    
+    if label:
+        await message.answer(
+            f"⚠️ <b>РЕЗУЛЬТАТ ПОИСКА</b> ⚠️\n\n"
+            f"👤 Username: @{username}\n"
+            f"🏷️ Метка: {label}\n"
+            f"📌 Статус: <b>В БАЗЕ СКАМЕРОВ</b>\n\n"
+            f"Будьте осторожны в общении с этим человеком!",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            f"✅ <b>РЕЗУЛЬТАТ ПОИСКА</b> ✅\n\n"
+            f"👤 Username: @{username}\n"
+            f"📌 Статус: <b>НЕ НАЙДЕН В БАЗЕ</b>\n\n"
+            f"Человек не числится в ScamBase.",
+            parse_mode="HTML"
+        )
+    
+    await state.clear()
+
+
+@dp.callback_query(F.data == "stats")
+async def show_stats(callback: CallbackQuery):
+    conn = sqlite3.connect('scambase.db')
+    cur = conn.cursor()
+    
+    cur.execute('SELECT COUNT(*) FROM scambase')
+    total_scammers = cur.fetchone()[0]
+    
+    cur.execute('SELECT label, COUNT(*) FROM scambase GROUP BY label')
+    labels_stats = cur.fetchall()
+    
+    cur.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
+    pending_reports = cur.fetchone()[0]
+    
+    conn.close()
+    
+    stats_text = f"📊 <b>Статистика ScamBase</b> 📊\n\n"
+    stats_text += f"👥 Всего в базе: <b>{total_scammers}</b>\n"
+    stats_text += f"📋 Ожидающих заявок: <b>{pending_reports}</b>\n\n"
+    stats_text += "<b>По меткам:</b>\n"
+    
+    for label, count in labels_stats:
+        emoji = "🔴" if label == "Scammer" else "🟡" if label == "Face" else "🟢"
+        stats_text += f"{emoji} {label}: {count}\n"
+    
+    await callback.message.answer(stats_text, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "delete_self")
+async def delete_self_prompt(callback: CallbackQuery):
+    user_label = is_in_scambase(callback.from_user.username or f"user_{callback.from_user.id}")
+    
+    if not user_label:
+        await callback.message.answer("✅ Вы не найдены в базе ScamBase. Удаление не требуется.")
+        await callback.answer()
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"⭐ Удалить за {STAR_PRICE} звёзд", callback_data="confirm_star_delete")],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_menu")]
+    ])
+    
+    await callback.message.answer(
+        f"⚠️ <b>Вы находитесь в ScamBase!</b> ⚠️\n\n"
+        f"Ваша метка: {user_label}\n\n"
+        f"Вы можете удалить себя из базы за <b>{STAR_PRICE} ⭐</b>\n\n"
+        f"Нажмите на кнопку ниже, чтобы оплатить звёздами Telegram.",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm_star_delete")
+async def process_star_delete(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    
     try:
-        if os.path.exists('db.json'):
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_dir = 'backups'
-            if not os.path.exists(backup_dir):
-                os.makedirs(backup_dir)
-            shutil.copy('db.json', f'{backup_dir}/db_{timestamp}.json')
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="Удаление из ScamBase",
+            description=f"Удаление вашего профиля из базы ScamBase",
+            payload=f"delete_{user_id}",
+            currency="XTR",
+            prices=[types.LabeledPrice(label="Удаление", amount=STAR_PRICE)],
+            need_name=False,
+            need_phone_number=False,
+            need_email=False
+        )
+        await callback.answer("💫 Отправлен счёт на оплату звёздами!")
     except Exception as e:
-        print(f"Ошибка бэкапа: {e}")
+        await callback.message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте позже.")
+        await callback.answer()
 
-def create_bot():
-    global BOT_USERNAME 
-    try:
-        delete_webhook()
-        
-        bot = telebot.TeleBot(TOKEN)
-        db = TinyDB('db.json')
-        User = Query()
-        bot_info = bot.get_me()
-        BOT_USERNAME = bot_info.username
-        print(f"🤖 Бот запущен: @{BOT_USERNAME}")
 
-        @bot.message_handler(commands=['start'])
-        def start_handler(message):
-            try:
-                user_id = message.from_user.id
-                username = message.from_user.username or "NoUsername"
-                first_name = message.from_user.first_name
-                last_name = message.from_user.last_name or ""
-                param = message.text.split()[1] if len(message.text.split()) > 1 else None
+@dp.pre_checkout_query()
+async def pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
+    await pre_checkout.answer(ok=True)
 
-                # Проверяем существование пользователя
-                user = db.get(User.user_id == user_id)
-                if not user:
-                    db.insert({
-                        'user_id': user_id,
-                        'balance': 0,
-                        'bets_count': 0,
-                        'wins_count': 0,
-                        'losses_count': 0,
-                        'total_earned': 0,
-                        'total_wagered': 0,
-                        'slots_played': 0,
-                        'slots_wins': 0,
-                        'reg_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'first_name': first_name,
-                        'last_name': last_name
-                    })
-                    print(f"📝 Новый пользователь: {user_id}")
 
-                if param == "bet":
-                    user_data = db.get(User.user_id == user_id)
-                    bot.send_message(message.chat.id,
-                                   f"<b>🎲 Сделать ставку</b>\n\n"
-                                   f"💰 Ваш баланс: <code>{user_data['balance']} звёзд</code>\n\n"
-                                   f"<b>Пришлите сумму звёзд для ставки.</b>\n"
-                                   f"<i>Минимальная ставка: 5 звёзд</i>",
-                                   parse_mode='HTML')
-                    bot.register_next_step_handler(message, process_bet_amount)
-                else:
-                    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-                    btn_profile = types.KeyboardButton("⚡️ Профиль")
-                    btn_add_stars = types.KeyboardButton("💰 Пополнить")
-                    btn_withdraw = types.KeyboardButton("🎁 Вывести")
-                    btn_bet = types.KeyboardButton("🎲 Ставка")
-                    btn_slots = types.KeyboardButton("🎰 Слоты")
-                    markup.add(btn_profile, btn_add_stars, btn_withdraw, btn_bet, btn_slots)
-                    
-                    bot.send_message(message.chat.id,
-                                   f"<b>👋 Добро пожаловать, @{username}</b>\n\n"
-                                   f"📢 Канал: <a href='{CHANNEL_LINK}'>тык</a>\n\n"
-                                   f"🎲 Ставки - выигрыш x2\n"
-                                   f"🎰 Слоты - x2, x5, x10",
-                                   parse_mode='HTML',
-                                   reply_markup=markup)
-            except Exception as e:
-                print(f"Ошибка start: {e}")
-                bot.send_message(message.chat.id, "❌ Ошибка")
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    username = message.from_user.username or f"user_{message.from_user.id}"
+    
+    if remove_from_scambase(username):
+        await message.answer(
+            "✅ <b>Оплата получена! Вы удалены из ScamBase.</b> ✅\n\n"
+            "Ваше имя больше не числится в базе скамеров.\n"
+            "Спасибо за оплату звёздами! 🌟",
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            "❌ Ошибка: вас не было в базе данных.\n"
+            "Возможно, вы уже были удалены ранее."
+        )
+    
+    is_admin_user = message.from_user.id in ADMIN_IDS
+    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
 
-        # ========== СТАВКИ ==========
-        def process_bet_amount(message):
-            try:
-                user_id = message.from_user.id
-                amount_text = message.text.strip()
-                
-                if not amount_text.isdigit():
-                    bot.send_message(message.chat.id, "❌ Введите число!")
-                    return
-                    
-                amount = int(amount_text)
-                user_data = db.get(User.user_id == user_id)
-                
-                if amount < 5:
-                    bot.send_message(message.chat.id, "❌ Минимум 5 звёзд!")
-                    return
-                    
-                if amount > user_data['balance']:
-                    bot.send_message(message.chat.id, f"❌ Недостаточно! Баланс: {user_data['balance']}⭐")
-                    return
-                
-                # Сохраняем ставку В БАЗУ ДАННЫХ
-                db.update({
-                    'temp_bet_amount': amount,
-                    'temp_bet_step': 'waiting_choice'
-                }, User.user_id == user_id)
-                
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                btn_more = types.InlineKeyboardButton("🎲 БОЛЬШЕ (4-6)", callback_data="game_more")
-                btn_less = types.InlineKeyboardButton("🎲 МЕНЬШЕ (1-3)", callback_data="game_less")
-                markup.add(btn_more, btn_less)
-                
-                bot.send_message(message.chat.id,
-                               f"<b>🎲 Ставка: {amount}⭐</b>\n\n"
-                               f"<b>Выберите исход:</b>",
-                               parse_mode='HTML',
-                               reply_markup=markup)
-            except Exception as e:
-                print(f"Ошибка process_bet: {e}")
-                bot.send_message(message.chat.id, "❌ Ошибка")
 
-        @bot.callback_query_handler(func=lambda call: call.data in ["game_more", "game_less"])
-        def game_choice(call):
-            try:
-                user_id = call.from_user.id
-                game_type = call.data.split("_")[1]
-                
-                user_data = db.get(User.user_id == user_id)
-                
-                # Проверяем есть ли временная ставка
-                if 'temp_bet_amount' not in user_data or user_data.get('temp_bet_step') != 'waiting_choice':
-                    bot.answer_callback_query(call.id, "❌ Ставка не найдена. Начните заново /start bet")
-                    return
-                
-                amount = user_data['temp_bet_amount']
-                
-                # Сохраняем выбор
-                db.update({
-                    'temp_bet_choice': game_type,
-                    'temp_bet_step': 'waiting_confirm'
-                }, User.user_id == user_id)
-                
-                markup = types.InlineKeyboardMarkup()
-                btn_yes = types.InlineKeyboardButton("✅ Да", callback_data="confirm_bet")
-                btn_no = types.InlineKeyboardButton("❌ Нет", callback_data="cancel_bet")
-                markup.add(btn_yes, btn_no)
-                
-                game_text = "БОЛЬШЕ" if game_type == "more" else "МЕНЬШЕ"
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"<b>🎲 Подтверждение</b>\n\n"
-                         f"💰 Сумма: {amount}⭐\n"
-                         f"🎯 Исход: {game_text}\n\n"
-                         f"Подтверждаете?",
-                    parse_mode='HTML',
-                    reply_markup=markup
-                )
-            except Exception as e:
-                print(f"Ошибка game_choice: {e}")
-                bot.answer_callback_query(call.id, "❌ Ошибка")
+# ================= ЗАЯВКИ НА СКАММЕРА =================
+@dp.callback_query(F.data == "report")
+async def report_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "📝 <b>Подача заявки на скамера</b>\n\n"
+        "Введите username человека, которого вы хотите добавить в базу (без @):",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+    await state.set_state(ReportStates.waiting_for_username)
 
-        @bot.callback_query_handler(func=lambda call: call.data == "confirm_bet")
-        def confirm_game(call):
-            try:
-                user_id = call.from_user.id
-                username = call.from_user.username or "NoUsername"
-                user_data = db.get(User.user_id == user_id)
-                
-                if 'temp_bet_amount' not in user_data or user_data.get('temp_bet_step') != 'waiting_confirm':
-                    bot.answer_callback_query(call.id, "❌ Ставка не найдена!")
-                    return
-                
-                amount = user_data['temp_bet_amount']
-                game_type = user_data['temp_bet_choice']
-                
-                # Проверяем баланс
-                if user_data['balance'] < amount:
-                    bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text="❌ Недостаточно средств!")
-                    db.update({'temp_bet_step': None}, User.user_id == user_id)
-                    return
-                
-                # Списываем ставку
-                new_balance = user_data['balance'] - amount
-                new_bets_count = user_data['bets_count'] + 1
-                new_total_wagered = user_data['total_wagered'] + amount
-                
-                db.update({
-                    'balance': new_balance,
-                    'bets_count': new_bets_count,
-                    'total_wagered': new_total_wagered,
-                    'temp_bet_step': 'playing'
-                }, User.user_id == user_id)
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"🎲 <b>Игра!</b>\n\nСтавка: {amount}⭐\n🎲 Бросаем кубик...",
-                    parse_mode='HTML'
-                )
-                
-                time.sleep(1)
-                dice = bot.send_dice(call.message.chat.id)
-                dice_value = dice.dice.value
-                
-                win = (game_type == "more" and dice_value >= 4) or (game_type == "less" and dice_value <= 3)
-                game_text = "БОЛЬШЕ" if game_type == "more" else "МЕНЬШЕ"
-                
-                if win:
-                    win_amount = amount * 2
-                    user_data = db.get(User.user_id == user_id)
-                    new_balance = user_data['balance'] + win_amount
-                    new_total_earned = user_data['total_earned'] + win_amount
-                    new_wins = user_data['wins_count'] + 1
-                    
-                    db.update({
-                        'balance': new_balance,
-                        'total_earned': new_total_earned,
-                        'wins_count': new_wins,
-                        'temp_bet_step': None
-                    }, User.user_id == user_id)
-                    
-                    bot.send_message(call.message.chat.id,
-                        f"<b>🎉 ПОБЕДА!</b>\n\n"
-                        f"🎲 Выпало: {dice_value}\n"
-                        f"🎯 Выбор: {game_text}\n\n"
-                        f"💰 Выигрыш: {win_amount}⭐\n"
-                        f"💎 Баланс: {new_balance}⭐",
-                        parse_mode='HTML')
-                else:
-                    new_losses = user_data['losses_count'] + 1
-                    db.update({
-                        'losses_count': new_losses,
-                        'temp_bet_step': None
-                    }, User.user_id == user_id)
-                    
-                    bot.send_message(call.message.chat.id,
-                        f"<b>😞 ПРОИГРЫШ</b>\n\n"
-                        f"🎲 Выпало: {dice_value}\n"
-                        f"🎯 Выбор: {game_text}\n\n"
-                        f"💔 Проигрыш: {amount}⭐\n"
-                        f"💎 Баланс: {user_data['balance'] - amount}⭐",
-                        parse_mode='HTML')
-                        
-            except Exception as e:
-                print(f"Ошибка confirm_game: {e}")
-                bot.send_message(call.message.chat.id, "❌ Ошибка")
 
-        @bot.callback_query_handler(func=lambda call: call.data == "cancel_bet")
-        def cancel_game(call):
-            try:
-                user_id = call.from_user.id
-                db.update({'temp_bet_step': None}, User.user_id == user_id)
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="❌ Ставка отменена"
-                )
-            except Exception as e:
-                pass
+@dp.message(ReportStates.waiting_for_username)
+async def report_get_username(message: Message, state: FSMContext):
+    username = message.text.strip().replace('@', '')
+    
+    if is_in_scambase(username):
+        await message.answer(
+            "⚠️ Этот человек уже находится в ScamBase!\n\n"
+            "Вы можете проверить его через поиск."
+        )
+        await state.clear()
+        return
+    
+    await state.update_data(report_username=username)
+    await message.answer(
+        "📸 Теперь отправьте <b>фото-доказательства</b> (можно несколько фото в одном сообщении)\n\n"
+        "Отправьте 'готово', если фото нет:",
+        parse_mode="HTML"
+    )
+    await state.set_state(ReportStates.waiting_for_proof_photos)
 
-        # ========== СЛОТЫ ==========
-        @bot.message_handler(func=lambda message: message.text == "🎰 Слоты")
-        def slots_handler(message):
-            try:
-                user_id = message.from_user.id
-                user_data = db.get(User.user_id == user_id)
-                
-                markup = types.InlineKeyboardMarkup(row_width=3)
-                buttons = [
-                    types.InlineKeyboardButton("10⭐", callback_data="slot_10"),
-                    types.InlineKeyboardButton("25⭐", callback_data="slot_25"),
-                    types.InlineKeyboardButton("50⭐", callback_data="slot_50"),
-                    types.InlineKeyboardButton("100⭐", callback_data="slot_100"),
-                    types.InlineKeyboardButton("250⭐", callback_data="slot_250"),
-                    types.InlineKeyboardButton("500⭐", callback_data="slot_500")
-                ]
-                markup.add(*buttons)
-                
-                bot.send_message(message.chat.id,
-                    f"<b>🎰 СЛОТЫ</b>\n\n"
-                    f"💰 Баланс: {user_data['balance']}⭐\n\n"
-                    f"<b>Выберите ставку:</b>\n"
-                    f"🎁 Выигрыши: x2, x5, x10\n"
-                    f"🎲 3 кубика - комбинации дают множитель!",
-                    parse_mode='HTML',
-                    reply_markup=markup)
-            except Exception as e:
-                print(f"Ошибка slots: {e}")
 
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("slot_"))
-        def play_slots(call):
-            try:
-                user_id = call.from_user.id
-                bet = int(call.data.split("_")[1])
-                username = call.from_user.username or "NoUsername"
-                user_data = db.get(User.user_id == user_id)
-                
-                if user_data['balance'] < bet:
-                    bot.answer_callback_query(call.id, "❌ Недостаточно звёзд!")
-                    return
-                
-                # Списываем ставку
-                new_balance = user_data['balance'] - bet
-                new_slots_played = user_data.get('slots_played', 0) + 1
-                
-                db.update({
-                    'balance': new_balance,
-                    'slots_played': new_slots_played,
-                    'total_wagered': user_data['total_wagered'] + bet
-                }, User.user_id == user_id)
-                
-                # Сообщение о начале
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"🎰 <b>СЛОТЫ</b>\n\nСтавка: {bet}⭐\n🎲 Крутим барабаны...",
-                    parse_mode='HTML'
-                )
-                
-                time.sleep(1)
-                
-                # Бросаем 3 кубика
-                dice1 = bot.send_dice(call.message.chat.id)
-                time.sleep(0.5)
-                dice2 = bot.send_dice(call.message.chat.id)
-                time.sleep(0.5)
-                dice3 = bot.send_dice(call.message.chat.id)
-                
-                val1 = dice1.dice.value
-                val2 = dice2.dice.value
-                val3 = dice3.dice.value
-                
-                # Определяем множитель
-                multiplier = 1
-                if val1 == val2 == val3:
-                    # Три одинаковых
-                    if val1 == 6:
-                        multiplier = 10  # Джекпот
-                    elif val1 in [5, 4]:
-                        multiplier = 5
-                    else:
-                        multiplier = 3
-                elif val1 == val2 or val2 == val3 or val1 == val3:
-                    multiplier = 2
-                
-                win_amount = bet * multiplier
-                
-                if multiplier > 1:
-                    user_data = db.get(User.user_id == user_id)
-                    new_balance = user_data['balance'] + win_amount
-                    new_slots_wins = user_data.get('slots_wins', 0) + 1
-                    new_total_earned = user_data['total_earned'] + win_amount
-                    
-                    db.update({
-                        'balance': new_balance,
-                        'slots_wins': new_slots_wins,
-                        'total_earned': new_total_earned
-                    }, User.user_id == user_id)
-                    
-                    # Эмодзи для кубиков
-                    emoji_map = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
-                    
-                    bot.send_message(call.message.chat.id,
-                        f"<b>🎉 ПОБЕДА В СЛОТАХ!</b>\n\n"
-                        f"🎲 {emoji_map[val1]} {emoji_map[val2]} {emoji_map[val3]}\n\n"
-                        f"⭐ Множитель: <b>x{multiplier}</b>\n"
-                        f"💰 Выигрыш: <b>{win_amount}⭐</b>\n"
-                        f"💎 Баланс: <b>{new_balance}⭐</b>",
-                        parse_mode='HTML')
-                else:
-                    emoji_map = {1: "1️⃣", 2: "2️⃣", 3: "3️⃣", 4: "4️⃣", 5: "5️⃣", 6: "6️⃣"}
-                    
-                    bot.send_message(call.message.chat.id,
-                        f"<b>😞 ПРОИГРЫШ В СЛОТАХ</b>\n\n"
-                        f"🎲 {emoji_map[val1]} {emoji_map[val2]} {emoji_map[val3]}\n\n"
-                        f"💔 Проигрыш: {bet}⭐\n"
-                        f"💎 Баланс: <b>{user_data['balance'] - bet}⭐</b>",
-                        parse_mode='HTML')
-                        
-            except Exception as e:
-                print(f"Ошибка play_slots: {e}")
-                bot.send_message(call.message.chat.id, "❌ Ошибка в слотах")
+@dp.message(ReportStates.waiting_for_proof_photos)
+async def report_get_photos(message: Message, state: FSMContext):
+    photos = []
+    
+    if message.photo:
+        photos = [message.photo[-1].file_id]
+    elif message.text and message.text.lower() == 'готово':
+        pass
+    elif message.text:
+        await message.answer("Пожалуйста, отправьте фото или напишите 'готово'")
+        return
+    
+    await state.update_data(report_photos=photos)
+    
+    await message.answer(
+        "🎥 Теперь отправьте <b>видео-доказательства</b> (можно несколько видео)\n\n"
+        "Отправьте 'готово', если видео нет:",
+        parse_mode="HTML"
+    )
+    await state.set_state(ReportStates.waiting_for_proof_videos)
 
-        # ========== ПРОФИЛЬ ==========
-        @bot.message_handler(func=lambda message: message.text == "⚡️ Профиль")
-        def profile_handler(message):
-            try:
-                user_id = message.from_user.id
-                user_data = db.get(User.user_id == user_id)
-                username = message.from_user.username or "NoUsername"
-                
-                winrate = 0
-                if user_data['bets_count'] > 0:
-                    winrate = (user_data['wins_count'] / user_data['bets_count']) * 100
-                
-                slots_winrate = 0
-                if user_data.get('slots_played', 0) > 0:
-                    slots_winrate = (user_data.get('slots_wins', 0) / user_data['slots_played']) * 100
-                
-                text = "🎲 <b>📊 ПРОФИЛЬ</b>\n"
-                text += "═" * 20 + "\n"
-                text += f"🆔 ID: <code>{user_id}</code>\n"
-                text += f"👤 Юзер: <code>@{username}</code>\n\n"
-                text += "💰 <b>БАЛАНС</b>\n"
-                text += f"⭐️ {user_data['balance']} звёзд\n\n"
-                text += "🎲 <b>СТАВКИ</b>\n"
-                text += f"📊 Всего: {user_data['bets_count']}\n"
-                text += f"✅ Побед: {user_data['wins_count']}\n"
-                text += f"❌ Поражений: {user_data['losses_count']}\n"
-                text += f"📈 Винрейт: {winrate:.1f}%\n"
-                text += f"💸 Выиграно: {user_data['total_earned']}⭐\n"
-                text += f"🎲 Поставлено: {user_data['total_wagered']}⭐\n\n"
-                text += "🎰 <b>СЛОТЫ</b>\n"
-                text += f"🎲 Игр: {user_data.get('slots_played', 0)}\n"
-                text += f"✅ Побед: {user_data.get('slots_wins', 0)}\n"
-                text += f"📈 Винрейт: {slots_winrate:.1f}%\n\n"
-                text += f"📅 Рег: {user_data['reg_date']}"
-                
-                bot.send_message(message.chat.id, text, parse_mode='HTML')
-            except Exception as e:
-                print(f"Ошибка profile: {e}")
-                bot.send_message(message.chat.id, "❌ Ошибка")
 
-        # ========== ПОПОЛНЕНИЕ ==========
-        @bot.message_handler(func=lambda message: message.text == "💰 Пополнить")
-        def add_stars_handler(message):
-            try:
-                bot.send_message(message.chat.id,
-                               "<b>💰 Пополнение</b>\n\nВведите количество звёзд:",
-                               parse_mode='HTML')
-                bot.register_next_step_handler(message, process_payment_amount)
-            except Exception as e:
-                print(f"Ошибка add: {e}")
-
-        def process_payment_amount(message):
-            try:
-                user_id = message.from_user.id
-                amount = int(message.text)
-                if amount <= 0:
-                    bot.send_message(message.chat.id, "❌ Введите положительное число!")
-                    return
-                bot.send_invoice(
-                    chat_id=message.chat.id,
-                    title="⭐️ Пополнение",
-                    description=f"Пополнение на {amount} звёзд",
-                    invoice_payload=f"payment_{user_id}_{amount}",
-                    provider_token="",
-                    currency="XTR",
-                    prices=[types.LabeledPrice(label="⭐️ Звёзды", amount=amount)]
-                )
-            except ValueError:
-                bot.send_message(message.chat.id, "❌ Введите число!")
-            except Exception as e:
-                print(f"Ошибка payment: {e}")
-
-        @bot.pre_checkout_query_handler(func=lambda query: True)
-        def process_pre_checkout_query(pre_checkout_query):
-            try:
-                bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-            except Exception as e:
-                print(f"Ошибка pre_checkout: {e}")
-
-        @bot.message_handler(content_types=['successful_payment'])
-        def process_successful_payment(message):
-            try:
-                user_id = message.from_user.id
-                amount = message.successful_payment.total_amount
-                user_data = db.get(User.user_id == user_id)
-                new_balance = user_data['balance'] + amount
-                db.update({'balance': new_balance}, User.user_id == user_id)
-                bot.send_message(message.chat.id, f"<b>✅ Пополнено!</b>\n\n⭐ {amount} звёзд\n💰 Новый баланс: {new_balance}⭐", parse_mode='HTML')
-            except Exception as e:
-                print(f"Ошибка success: {e}")
-
-        # ========== ВЫВОД ==========
-        @bot.message_handler(func=lambda message: message.text == "🎁 Вывести")
-        def withdraw_stars_handler(message):
-            try:
-                user_id = message.from_user.id
-                user_data = db.get(User.user_id == user_id)
-                balance = user_data['balance']
-                
-                if balance < 15:
-                    bot.send_message(message.chat.id, "❌ Минимум 15 звёзд")
-                    return
-                
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                buttons = []
-                for amt in [15, 25, 50, 100, 150, 350, 500]:
-                    if balance >= amt:
-                        buttons.append(types.InlineKeyboardButton(f"{amt}⭐", callback_data=f"withdraw_{amt}"))
-                markup.add(*buttons)
-                
-                bot.send_message(message.chat.id,
-                               f"<b>🎁 Вывод</b>\n\n💰 Баланс: {balance}⭐\n\nВыберите сумму:",
-                               parse_mode='HTML',
-                               reply_markup=markup)
-            except Exception as e:
-                print(f"Ошибка withdraw: {e}")
-
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("withdraw_"))
-        def withdraw_amount_choice(call):
-            try:
-                user_id = call.from_user.id
-                count = int(call.data.split("_")[1])
-                
-                markup = types.InlineKeyboardMarkup()
-                markup.add(
-                    types.InlineKeyboardButton("✅ Да", callback_data=f"confirm_withdraw_{count}"),
-                    types.InlineKeyboardButton("❌ Нет", callback_data="cancel_withdraw")
-                )
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"<b>🎁 Подтверждение</b>\n\nВывести {count} звёзд?",
-                    parse_mode='HTML',
-                    reply_markup=markup
-                )
-            except Exception as e:
-                print(f"Ошибка withdraw_choice: {e}")
-
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("confirm_withdraw_"))
-        def confirm_withdraw(call):
-            try:
-                user_id = call.from_user.id
-                count = int(call.data.split("_")[2])
-                user_data = db.get(User.user_id == user_id)
-                username = call.from_user.username or "NoUsername"
-                
-                if user_data['balance'] < count:
-                    bot.answer_callback_query(call.id, "❌ Недостаточно!")
-                    return
-                
-                new_balance = user_data['balance'] - count
-                db.update({'balance': new_balance}, User.user_id == user_id)
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"<b>✅ Заявка отправлена!</b>\n\n⭐ {count} звёзд\n⏱ Ожидайте 72 часа",
-                    parse_mode='HTML'
-                )
-                
-                # Отправляем админу
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("✅ Выдано", callback_data=f"issued_{user_id}_{count}"))
-                
-                bot.send_message(
-                    ADMIN_CHANNEL_ID,
-                    f"<b>📝 НОВАЯ ЗАЯВКА</b>\n\n👤 @{username}\n🆔 {user_id}\n⭐ {count} звёзд",
-                    parse_mode='HTML',
-                    reply_markup=markup
-                )
-            except Exception as e:
-                print(f"Ошибка confirm_withdraw: {e}")
-
-        @bot.callback_query_handler(func=lambda call: call.data == "cancel_withdraw")
-        def cancel_withdraw(call):
-            try:
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="❌ Вывод отменён"
-                )
-            except Exception as e:
-                pass
-
-        @bot.callback_query_handler(func=lambda call: call.data.startswith("issued_"))
-        def issue_withdraw(call):
-            try:
-                user_id = int(call.data.split("_")[1])
-                count = int(call.data.split("_")[2])
-                
-                bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=call.message.text + "\n\n✅ ВЫДАНО",
-                    parse_mode='HTML'
-                )
-                
-                bot.send_message(user_id, f"<b>✅ Заявка на вывод {count}⭐ выполнена!</b>", parse_mode='HTML')
-            except Exception as e:
-                print(f"Ошибка issued: {e}")
-
-        # ========== КНОПКА СТАВКА ==========
-        @bot.message_handler(func=lambda message: message.text == "🎲 Ставка")
-        def bet_button_handler(message):
-            user_id = message.from_user.id
-            user_data = db.get(User.user_id == user_id)
-            bot.send_message(message.chat.id,
-                           f"<b>🎲 СТАВКА</b>\n\n💰 Баланс: {user_data['balance']}⭐\n\nВведите сумму (мин 5⭐):",
-                           parse_mode='HTML')
-            bot.register_next_step_handler(message, process_bet_amount)
-
-        return bot
-
-    except Exception as e:
-        print(f"Ошибка create_bot: {e}")
-        return None
-
-def run_bot():
-    while True:
+@dp.message(ReportStates.waiting_for_proof_videos)
+async def report_get_videos(message: Message, state: FSMContext):
+    videos = []
+    
+    if message.video:
+        videos = [message.video.file_id]
+    elif message.text and message.text.lower() == 'готово':
+        pass
+    elif message.text:
+        await message.answer("Пожалуйста, отправьте видео или напишите 'готово'")
+        return
+    
+    data = await state.get_data()
+    username = data.get('report_username')
+    photos = data.get('report_photos', [])
+    
+    add_report(username, message.from_user.id, photos, videos)
+    
+    for admin_id in ADMIN_IDS:
         try:
-            delete_webhook()
-            bot = create_bot()
-            if bot is None:
-                raise Exception("Не удалось создать бота")
-            
-            print("🚀 Бот запущен!")
-            backup_database()
-            bot.polling(none_stop=True, timeout=60, skip_pending=True)
-            
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
-            print("🔄 Перезапуск через 5 секунд...")
-            time.sleep(5)
+            await bot.send_message(
+                admin_id,
+                f"📋 <b>НОВАЯ ЗАЯВКА В SCAMBASE!</b>\n\n"
+                f"👤 Пользователь: @{username}\n"
+                f"📝 Подал: {message.from_user.full_name} (ID: {message.from_user.id})\n"
+                f"📸 Фото: {len(photos)} шт.\n"
+                f"🎥 Видео: {len(videos)} шт.\n\n"
+                f"Используйте админ-панель для рассмотрения заявки.",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+    
+    await message.answer(
+        "✅ <b>Заявка успешно отправлена!</b> ✅\n\n"
+        f"👤 Человек: @{username}\n"
+        f"📸 Доказательств: {len(photos)} фото, {len(videos)} видео\n\n"
+        "Администраторы рассмотрят вашу заявку в ближайшее время.\n"
+        "Спасибо за помощь в борьбе со скамерами! 🙏",
+        parse_mode="HTML"
+    )
+    
+    is_admin_user = message.from_user.id in ADMIN_IDS
+    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
+    await state.clear()
+
+
+# ================= АДМИН-ПАНЕЛЬ =================
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён! Вы не администратор.", show_alert=True)
+        return
+    
+    await callback.message.answer(
+        "👑 <b>Панель администратора ScamBase</b> 👑\n\n"
+        "Выберите действие:",
+        parse_mode="HTML",
+        reply_markup=admin_panel_keyboard()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_add")
+async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    await callback.message.answer("➕ Введите username для добавления в базу (без @):")
+    await callback.answer()
+    await state.set_state(AdminAddStates.waiting_for_username)
+
+
+@dp.message(AdminAddStates.waiting_for_username)
+async def admin_add_get_username(message: Message, state: FSMContext):
+    username = message.text.strip().replace('@', '')
+    
+    if is_in_scambase(username):
+        await message.answer("⚠️ Этот пользователь уже есть в базе!")
+        await state.clear()
+        return
+    
+    await state.update_data(add_username=username)
+    await message.answer(
+        "🏷️ Выберите метку для пользователя:",
+        reply_markup=label_keyboard(username, "add")
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("add_label_"))
+async def admin_add_with_label(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    username = parts[2]
+    label = parts[3]
+    
+    if add_to_scambase(username, label, callback.from_user.id):
+        await callback.message.answer(f"✅ Пользователь @{username} добавлен в ScamBase с меткой {label}!")
+    else:
+        await callback.message.answer(f"❌ Ошибка при добавлении пользователя @{username}.")
+    
+    await callback.answer()
+    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
+
+
+@dp.callback_query(F.data == "admin_remove")
+async def admin_remove_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    await callback.message.answer("❌ Введите username для удаления из базы (без @):")
+    await callback.answer()
+    await state.set_state(AdminRemoveStates.waiting_for_username)
+
+
+@dp.message(AdminRemoveStates.waiting_for_username)
+async def admin_remove_user(message: Message, state: FSMContext):
+    username = message.text.strip().replace('@', '')
+    
+    if remove_from_scambase(username):
+        await message.answer(f"✅ Пользователь @{username} удалён из ScamBase!")
+    else:
+        await message.answer(f"❌ Пользователь @{username} не найден в базе.")
+    
+    await state.clear()
+    await message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
+
+
+@dp.callback_query(F.data == "admin_label")
+async def admin_label_prompt(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    await callback.message.answer("🏷️ Введите username для изменения метки (без @):")
+    await callback.answer()
+    await state.set_state("waiting_label_username")
+
+
+@dp.message(StateFilter("waiting_label_username"))
+async def admin_label_get_username(message: Message, state: FSMContext):
+    username = message.text.strip().replace('@', '')
+    
+    if not is_in_scambase(username):
+        await message.answer("❌ Пользователь не найден в базе!")
+        await state.clear()
+        return
+    
+    await state.update_data(label_username=username)
+    await message.answer(
+        f"🏷️ Выберите новую метку для @{username}:",
+        reply_markup=label_keyboard(username, "change")
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("change_label_"))
+async def admin_change_label(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    username = parts[2]
+    new_label = parts[3]
+    
+    if update_label(username, new_label):
+        await callback.message.answer(f"✅ Метка для @{username} изменена на {new_label}!")
+    else:
+        await callback.message.answer(f"❌ Ошибка: пользователь @{username} не найден.")
+    
+    await callback.answer()
+    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
+
+
+@dp.callback_query(F.data == "admin_reports")
+async def admin_show_reports(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    reports = get_pending_reports()
+    
+    if not reports:
+        await callback.message.answer("📭 Нет ожидающих заявок.")
+        await callback.answer()
+        return
+    
+    for report in reports:
+        report_id, username, reported_by, photos, videos, date = report
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить (Scammer)", callback_data=f"approve_{report_id}_{username}_Scammer"),
+                InlineKeyboardButton(text="✅ Одобрить (Face)", callback_data=f"approve_{report_id}_{username}_Face"),
+                InlineKeyboardButton(text="✅ Одобрить (Worker)", callback_data=f"approve_{report_id}_{username}_Worker")
+            ],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{report_id}")]
+        ])
+        
+        text = f"📋 <b>Заявка #{report_id}</b>\n"
+        text += f"👤 Username: @{username}\n"
+        text += f"👮 Подал: ID {reported_by}\n"
+        text += f"📅 Дата: {date[:19]}\n"
+        text += f"📸 Фото: {len(photos.split(',')) if photos else 0}\n"
+        text += f"🎥 Видео: {len(videos.split(',')) if videos else 0}\n"
+        
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+    
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def admin_approve_report(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    report_id = int(parts[1])
+    username = parts[2]
+    label = parts[3]
+    
+    approve_report(report_id, username, label, callback.from_user.id)
+    
+    await callback.message.answer(f"✅ Заявка #{report_id} одобрена! @{username} добавлен в базу с меткой {label}.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("reject_"))
+async def admin_reject_report(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+        return
+    
+    report_id = int(callback.data.split("_")[1])
+    reject_report(report_id)
+    
+    await callback.message.answer(f"❌ Заявка #{report_id} отклонена.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "back_to_menu")
+async def back_to_menu(callback: CallbackQuery):
+    is_admin_user = callback.from_user.id in ADMIN_IDS
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
+    await callback.answer()
+
+
+# ================= ЗАПУСК БОТА =================
+async def main():
+    init_db()
+    print("✅ Бот ScamBase запущен!")
+    await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
-    print("🎲 Бот запускается...")
-    run_bot()
+    asyncio.run(main())
