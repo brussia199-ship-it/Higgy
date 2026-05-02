@@ -8,6 +8,18 @@ from datetime import datetime
 from config import TOKEN, CHANNEL_ID, CHANNEL_LINK, ADMIN_CHANNEL_ID
 import os
 
+# Функция для удаления вебхука
+def delete_webhook():
+    try:
+        bot_temp = telebot.TeleBot(TOKEN)
+        bot_temp.remove_webhook()
+        time.sleep(1)
+        print("✅ Вебхук успешно удалён")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка при удалении вебхука: {e}")
+        return False
+
 # Функция для создания бэкапа базы данных
 def backup_database():
     try:
@@ -28,6 +40,9 @@ def backup_database():
 def create_bot():
     global BOT_USERNAME 
     try:
+        # Сначала удаляем вебхук
+        delete_webhook()
+        
         bot = telebot.TeleBot(TOKEN)
         db = TinyDB('db.json')
         User = Query()
@@ -568,13 +583,18 @@ def run_bot():
     global BOT_USERNAME  
     while True:
         try:
+            # При каждом запуске удаляем вебхук
+            delete_webhook()
+            
             bot = create_bot()
             if bot is None:
                 raise Exception("Не удалось создать бота")
             
             print("🚀 Бот запущен и работает...")
             backup_database()  # Создаём бэкап при старте
-            bot.polling(none_stop=True, timeout=60)
+            
+            # Запускаем polling с явным удалением вебхука
+            bot.polling(none_stop=True, timeout=60, skip_pending=True)
             
         except Exception as e:
             print(f"❌ Ошибка: {str(e)}")
