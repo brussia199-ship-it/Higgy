@@ -1,665 +1,531 @@
 import asyncio
-import sqlite3
-import os
 from datetime import datetime
-from typing import Optional, Tuple
-
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter  # ← ДОБАВЛЕН StateFilter
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+import sqlite3
+import os
 
-# ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8655931539:AAE9DjvBYScMBrutC17TP0UaLBc_jj_bo2U"  # Замените на ваш токен от @BotFather
-ADMIN_IDS = [7673683792]  # ID администраторов (укажите свои)
-STAR_PRICE = 500  # Стоимость удаления в звёздах Telegram
+# ========== КОНФИГУРАЦИЯ ==========
+BOT_TOKEN = "8750633312:AAEBwJ2dyno_elQFUPNBeogYWSWj43pvCTQ"
+ADMIN_ID = 7673683792
+IMAGE_PATH = "support.jpg"  # Положите картинку в папку с ботом
 
-# ================= СОСТОЯНИЯ FSM =================
-class ReportStates(StatesGroup):
-    waiting_for_username = State()
-    waiting_for_proof_photos = State()
-    waiting_for_proof_videos = State()
+# ========== БАЗА ДАННЫХ ==========
+conn = sqlite3.connect('support_bot.db', check_same_thread=False)
+cursor = conn.cursor()
 
-class AdminAddStates(StatesGroup):
-    waiting_for_username = State()
-    waiting_for_label = State()
+def init_db():
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_helper INTEGER DEFAULT 0
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            question TEXT,
+            status TEXT DEFAULT 'open',
+            helper_id INTEGER DEFAULT NULL,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER,
+            user_id INTEGER,
+            message TEXT,
+            is_from_helper INTEGER DEFAULT 0,
+            created_at TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, username, is_helper) VALUES (?, ?, ?)', 
+                   (ADMIN_ID, 'admin', 1))
+    
+    conn.commit()
+    print("База данных готова")
 
-class AdminRemoveStates(StatesGroup):
-    waiting_for_username = State()
+init_db()
 
-# ================= ИНИЦИАЛИЗАЦИЯ =================
 bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
+# ========== СОСТОЯНИЯ ==========
+class TicketStates(StatesGroup):
+    waiting_question = State()
+    waiting_answer = State()
+    waiting_ticket_id = State()
+    waiting_helper_id = State()
 
-# ================= РАБОТА С БАЗОЙ ДАННЫХ =================
-def init_db():
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS scambase (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            label TEXT DEFAULT 'Scammer',
-            added_by INTEGER,
-            added_date TEXT,
-            proof_photos TEXT DEFAULT '',
-            proof_videos TEXT DEFAULT ''
-        )
-    ''')
-    
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS reports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            reported_by INTEGER,
-            proof_photos TEXT,
-            proof_videos TEXT,
-            status TEXT DEFAULT 'pending',
-            report_date TEXT
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
-
-
-def is_in_scambase(username: str) -> Optional[str]:
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('SELECT label FROM scambase WHERE username = ?', (username,))
-    result = cur.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-
-def add_to_scambase(username: str, label: str, admin_id: int, proof_photos: str = '', proof_videos: str = '') -> bool:
-    try:
-        conn = sqlite3.connect('scambase.db')
-        cur = conn.cursor()
-        cur.execute('''
-            INSERT INTO scambase (username, label, added_by, added_date, proof_photos, proof_videos)
-            VALUES (?, ?, ?, ?, ?, ?)
-        ''', (username, label, admin_id, datetime.now().isoformat(), proof_photos, proof_videos))
-        conn.commit()
-        conn.close()
-        return True
-    except sqlite3.IntegrityError:
-        return False
-
-
-def remove_from_scambase(username: str) -> bool:
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('DELETE FROM scambase WHERE username = ?', (username,))
-    deleted = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return deleted
-
-
-def update_label(username: str, new_label: str) -> bool:
-    if new_label not in ['Scammer', 'Face', 'Worker']:
-        return False
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('UPDATE scambase SET label = ? WHERE username = ?', (new_label, username))
-    updated = cur.rowcount > 0
-    conn.commit()
-    conn.close()
-    return updated
-
-
-def add_report(username: str, user_id: int, photos: list, videos: list) -> bool:
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO reports (username, reported_by, proof_photos, proof_videos, status, report_date)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (username, user_id, ','.join(photos), ','.join(videos), 'pending', datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-    return True
-
-
-def get_pending_reports() -> list:
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('SELECT id, username, reported_by, proof_photos, proof_videos, report_date FROM reports WHERE status = "pending"')
-    results = cur.fetchall()
-    conn.close()
-    return results
-
-
-def approve_report(report_id: int, username: str, label: str, admin_id: int):
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('UPDATE reports SET status = "approved" WHERE id = ?', (report_id,))
-    cur.execute('''
-        INSERT OR IGNORE INTO scambase (username, label, added_by, added_date)
-        VALUES (?, ?, ?, ?)
-    ''', (username, label, admin_id, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-
-def reject_report(report_id: int):
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    cur.execute('UPDATE reports SET status = "rejected" WHERE id = ?', (report_id,))
-    conn.commit()
-    conn.close()
-
-
-# ================= КЛАВИАТУРЫ =================
-def main_menu_keyboard(is_admin_user: bool = False) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔍 Поиск в ScamBase", callback_data="search")
-    builder.button(text="⭐ Удалить себя (500 ⭐)", callback_data="delete_self")
-    builder.button(text="📝 Подать заявку на скаммера", callback_data="report")
-    builder.button(text="📊 Статистика", callback_data="stats")
-    
-    if is_admin_user:
-        builder.button(text="👑 Админ-панель", callback_data="admin_panel")
-    
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def admin_panel_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="➕ Добавить в базу", callback_data="admin_add")
-    builder.button(text="❌ Удалить из базы", callback_data="admin_remove")
-    builder.button(text="🏷️ Выдать метку", callback_data="admin_label")
-    builder.button(text="📋 Заявки от пользователей", callback_data="admin_reports")
-    builder.button(text="🔙 Назад", callback_data="back_to_menu")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-def label_keyboard(username: str, action: str = "add") -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔴 Scammer", callback_data=f"{action}_label_{username}_Scammer")
-    builder.button(text="🟡 Face", callback_data=f"{action}_label_{username}_Face")
-    builder.button(text="🟢 Worker", callback_data=f"{action}_label_{username}_Worker")
-    builder.button(text="🔙 Отмена", callback_data="admin_panel")
-    builder.adjust(1)
-    return builder.as_markup()
-
-
-# ================= ОБЩИЕ ХЕНДЛЕРЫ =================
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    await message.answer(
-        "👋 Добро пожаловать в ScamBase Bot!\n\n"
-        "🔍 Я помогу проверить, есть ли человек в базе скамеров.\n"
-        "📝 Также ты можешь подать заявку на добавление скамера с доказательствами.\n\n"
-        "Используй кнопки ниже для навигации:",
-        reply_markup=main_menu_keyboard(is_admin_user)
-    )
-
-
-@dp.callback_query(F.data == "search")
-async def search_prompt(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("🔍 Введите username человека для проверки (без @):")
-    await callback.answer()
-    await state.set_state("waiting_for_search")
-
-
-@dp.message(StateFilter("waiting_for_search"))
-async def perform_search(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
-    label = is_in_scambase(username)
-    
-    if label:
-        await message.answer(
-            f"⚠️ <b>РЕЗУЛЬТАТ ПОИСКА</b> ⚠️\n\n"
-            f"👤 Username: @{username}\n"
-            f"🏷️ Метка: {label}\n"
-            f"📌 Статус: <b>В БАЗЕ СКАМЕРОВ</b>\n\n"
-            f"Будьте осторожны в общении с этим человеком!",
-            parse_mode="HTML"
-        )
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+async def send_with_image(chat_id, text, reply_markup=None):
+    if os.path.exists(IMAGE_PATH):
+        photo = FSInputFile(IMAGE_PATH)
+        await bot.send_photo(chat_id=chat_id, photo=photo, caption=text, parse_mode="Markdown", reply_markup=reply_markup)
     else:
-        await message.answer(
-            f"✅ <b>РЕЗУЛЬТАТ ПОИСКА</b> ✅\n\n"
-            f"👤 Username: @{username}\n"
-            f"📌 Статус: <b>НЕ НАЙДЕН В БАЗЕ</b>\n\n"
-            f"Человек не числится в ScamBase.",
-            parse_mode="HTML"
-        )
-    
-    await state.clear()
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=reply_markup)
 
+def is_helper(user_id):
+    cursor.execute('SELECT is_helper FROM users WHERE user_id = ?', (user_id,))
+    row = cursor.fetchone()
+    return row and row[0] == 1
 
-@dp.callback_query(F.data == "stats")
-async def show_stats(callback: CallbackQuery):
-    conn = sqlite3.connect('scambase.db')
-    cur = conn.cursor()
-    
-    cur.execute('SELECT COUNT(*) FROM scambase')
-    total_scammers = cur.fetchone()[0]
-    
-    cur.execute('SELECT label, COUNT(*) FROM scambase GROUP BY label')
-    labels_stats = cur.fetchall()
-    
-    cur.execute('SELECT COUNT(*) FROM reports WHERE status = "pending"')
-    pending_reports = cur.fetchone()[0]
-    
-    conn.close()
-    
-    stats_text = f"📊 <b>Статистика ScamBase</b> 📊\n\n"
-    stats_text += f"👥 Всего в базе: <b>{total_scammers}</b>\n"
-    stats_text += f"📋 Ожидающих заявок: <b>{pending_reports}</b>\n\n"
-    stats_text += "<b>По меткам:</b>\n"
-    
-    for label, count in labels_stats:
-        emoji = "🔴" if label == "Scammer" else "🟡" if label == "Face" else "🟢"
-        stats_text += f"{emoji} {label}: {count}\n"
-    
-    await callback.message.answer(stats_text, parse_mode="HTML")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "delete_self")
-async def delete_self_prompt(callback: CallbackQuery):
-    user_label = is_in_scambase(callback.from_user.username or f"user_{callback.from_user.id}")
-    
-    if not user_label:
-        await callback.message.answer("✅ Вы не найдены в базе ScamBase. Удаление не требуется.")
-        await callback.answer()
-        return
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"⭐ Удалить за {STAR_PRICE} звёзд", callback_data="confirm_star_delete")],
-        [InlineKeyboardButton(text="🔙 Отмена", callback_data="back_to_menu")]
+def user_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♦ Создать тикет", callback_data="create_ticket")],
+        [InlineKeyboardButton(text="♦ Мои тикеты", callback_data="my_tickets")],
+        [InlineKeyboardButton(text="♦ Статус тикета", callback_data="ticket_status")]
     ])
+
+def helper_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♦ Открытые тикеты", callback_data="open_tickets")],
+        [InlineKeyboardButton(text="♦ Мои тикеты", callback_data="my_helper_tickets")],
+        [InlineKeyboardButton(text="♦ Закрыть тикет", callback_data="close_ticket")],
+        [InlineKeyboardButton(text="♦ Открыть тикет", callback_data="reopen_ticket")]
+    ])
+
+def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♦ Список хелперов", callback_data="list_helpers")],
+        [InlineKeyboardButton(text="♦ Добавить хелпера", callback_data="add_helper")],
+        [InlineKeyboardButton(text="♦ Удалить хелпера", callback_data="remove_helper")],
+        [InlineKeyboardButton(text="♦ Все тикеты", callback_data="all_tickets")],
+        [InlineKeyboardButton(text="♦ Удалить тикет", callback_data="admin_delete_ticket")],
+        [InlineKeyboardButton(text="♦ Ответственный", callback_data="ticket_helper")]
+    ])
+
+# ========== ПОЛЬЗОВАТЕЛЬСКИЕ ФУНКЦИИ ==========
+@dp.message(Command("start"))
+async def start(msg: types.Message):
+    user_id = msg.from_user.id
+    username = msg.from_user.username or str(user_id)
     
-    await callback.message.answer(
-        f"⚠️ <b>Вы находитесь в ScamBase!</b> ⚠️\n\n"
-        f"Ваша метка: {user_label}\n\n"
-        f"Вы можете удалить себя из базы за <b>{STAR_PRICE} ⭐</b>\n\n"
-        f"Нажмите на кнопку ниже, чтобы оплатить звёздами Telegram.",
-        parse_mode="HTML",
-        reply_markup=keyboard
+    cursor.execute('INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)', (user_id, username))
+    conn.commit()
+    
+    await send_with_image(
+        msg.chat.id,
+        "♦ *Система поддержки* ♦\n\n"
+        "• Создайте тикет с вашим вопросом\n"
+        "• Хелпер ответит вам в ближайшее время\n"
+        "• Отслеживайте статус в разделе «Мои тикеты»",
+        reply_markup=user_menu()
     )
-    await callback.answer()
 
+@dp.callback_query(F.data == "create_ticket")
+async def create_ticket(call: types.CallbackQuery, state: FSMContext):
+    await call.message.edit_text("♦ *Опишите вашу проблему:*\n\n(Максимум 500 символов)")
+    await state.set_state(TicketStates.waiting_question)
 
-@dp.callback_query(F.data == "confirm_star_delete")
-async def process_star_delete(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    
-    try:
-        await bot.send_invoice(
-            chat_id=user_id,
-            title="Удаление из ScamBase",
-            description=f"Удаление вашего профиля из базы ScamBase",
-            payload=f"delete_{user_id}",
-            currency="XTR",
-            prices=[types.LabeledPrice(label="Удаление", amount=STAR_PRICE)],
-            need_name=False,
-            need_phone_number=False,
-            need_email=False
-        )
-        await callback.answer("💫 Отправлен счёт на оплату звёздами!")
-    except Exception as e:
-        await callback.message.answer(f"❌ Ошибка: {str(e)}\nПопробуйте позже.")
-        await callback.answer()
-
-
-@dp.pre_checkout_query()
-async def pre_checkout_query(pre_checkout: types.PreCheckoutQuery):
-    await pre_checkout.answer(ok=True)
-
-
-@dp.message(F.successful_payment)
-async def successful_payment(message: Message):
-    username = message.from_user.username or f"user_{message.from_user.id}"
-    
-    if remove_from_scambase(username):
-        await message.answer(
-            "✅ <b>Оплата получена! Вы удалены из ScamBase.</b> ✅\n\n"
-            "Ваше имя больше не числится в базе скамеров.\n"
-            "Спасибо за оплату звёздами! 🌟",
-            parse_mode="HTML"
-        )
-    else:
-        await message.answer(
-            "❌ Ошибка: вас не было в базе данных.\n"
-            "Возможно, вы уже были удалены ранее."
-        )
-    
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
-
-
-# ================= ЗАЯВКИ НА СКАММЕРА =================
-@dp.callback_query(F.data == "report")
-async def report_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer(
-        "📝 <b>Подача заявки на скамера</b>\n\n"
-        "Введите username человека, которого вы хотите добавить в базу (без @):",
-        parse_mode="HTML"
-    )
-    await callback.answer()
-    await state.set_state(ReportStates.waiting_for_username)
-
-
-@dp.message(ReportStates.waiting_for_username)
-async def report_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
-    
-    if is_in_scambase(username):
-        await message.answer(
-            "⚠️ Этот человек уже находится в ScamBase!\n\n"
-            "Вы можете проверить его через поиск."
-        )
-        await state.clear()
+@dp.message(TicketStates.waiting_question)
+async def save_ticket(msg: types.Message, state: FSMContext):
+    if len(msg.text) > 500:
+        await msg.answer("♦ Слишком длинное сообщение! Максимум 500 символов.")
         return
     
-    await state.update_data(report_username=username)
-    await message.answer(
-        "📸 Теперь отправьте <b>фото-доказательства</b> (можно несколько фото в одном сообщении)\n\n"
-        "Отправьте 'готово', если фото нет:",
-        parse_mode="HTML"
+    user_id = msg.from_user.id
+    username = msg.from_user.username or str(user_id)
+    question = msg.text
+    now = datetime.now()
+    
+    cursor.execute('''
+        INSERT INTO tickets (user_id, username, question, status, created_at, updated_at)
+        VALUES (?, ?, ?, 'open', ?, ?)
+    ''', (user_id, username, question, now, now))
+    conn.commit()
+    
+    ticket_id = cursor.lastrowid
+    
+    await msg.answer(
+        f"♦ *Тикет #{ticket_id} создан!*\n\n"
+        f"Хелпер ответит вам в ближайшее время.\n"
+        f"Вы можете отслеживать статус в разделе «Мои тикеты»",
+        reply_markup=user_menu()
     )
-    await state.set_state(ReportStates.waiting_for_proof_photos)
-
-
-@dp.message(ReportStates.waiting_for_proof_photos)
-async def report_get_photos(message: Message, state: FSMContext):
-    photos = []
     
-    if message.photo:
-        photos = [message.photo[-1].file_id]
-    elif message.text and message.text.lower() == 'готово':
-        pass
-    elif message.text:
-        await message.answer("Пожалуйста, отправьте фото или напишите 'готово'")
-        return
-    
-    await state.update_data(report_photos=photos)
-    
-    await message.answer(
-        "🎥 Теперь отправьте <b>видео-доказательства</b> (можно несколько видео)\n\n"
-        "Отправьте 'готово', если видео нет:",
-        parse_mode="HTML"
-    )
-    await state.set_state(ReportStates.waiting_for_proof_videos)
-
-
-@dp.message(ReportStates.waiting_for_proof_videos)
-async def report_get_videos(message: Message, state: FSMContext):
-    videos = []
-    
-    if message.video:
-        videos = [message.video.file_id]
-    elif message.text and message.text.lower() == 'готово':
-        pass
-    elif message.text:
-        await message.answer("Пожалуйста, отправьте видео или напишите 'готово'")
-        return
-    
-    data = await state.get_data()
-    username = data.get('report_username')
-    photos = data.get('report_photos', [])
-    
-    add_report(username, message.from_user.id, photos, videos)
-    
-    for admin_id in ADMIN_IDS:
+    # Уведомляем хелперов
+    cursor.execute('SELECT user_id FROM users WHERE is_helper = 1')
+    helpers = cursor.fetchall()
+    for helper in helpers:
         try:
             await bot.send_message(
-                admin_id,
-                f"📋 <b>НОВАЯ ЗАЯВКА В SCAMBASE!</b>\n\n"
-                f"👤 Пользователь: @{username}\n"
-                f"📝 Подал: {message.from_user.full_name} (ID: {message.from_user.id})\n"
-                f"📸 Фото: {len(photos)} шт.\n"
-                f"🎥 Видео: {len(videos)} шт.\n\n"
-                f"Используйте админ-панель для рассмотрения заявки.",
-                parse_mode="HTML"
+                helper[0],
+                f"♦ *Новый тикет!*\n\n"
+                f"▪ ID: #{ticket_id}\n"
+                f"▪ От: @{username}\n"
+                f"▪ Вопрос: {question[:100]}...",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="♦ Ответить", callback_data=f"answer_ticket_{ticket_id}")]
+                ])
             )
         except:
             pass
     
-    await message.answer(
-        "✅ <b>Заявка успешно отправлена!</b> ✅\n\n"
-        f"👤 Человек: @{username}\n"
-        f"📸 Доказательств: {len(photos)} фото, {len(videos)} видео\n\n"
-        "Администраторы рассмотрят вашу заявку в ближайшее время.\n"
-        "Спасибо за помощь в борьбе со скамерами! 🙏",
-        parse_mode="HTML"
-    )
-    
-    is_admin_user = message.from_user.id in ADMIN_IDS
-    await message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
     await state.clear()
 
-
-# ================= АДМИН-ПАНЕЛЬ =================
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-@dp.callback_query(F.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён! Вы не администратор.", show_alert=True)
+@dp.callback_query(F.data == "my_tickets")
+async def my_tickets(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    
+    cursor.execute('''
+        SELECT id, status, created_at FROM tickets 
+        WHERE user_id = ? 
+        ORDER BY created_at DESC
+    ''', (user_id,))
+    tickets = cursor.fetchall()
+    
+    if not tickets:
+        await call.answer("У вас нет тикетов", show_alert=True)
         return
     
-    await callback.message.answer(
-        "👑 <b>Панель администратора ScamBase</b> 👑\n\n"
-        "Выберите действие:",
-        parse_mode="HTML",
-        reply_markup=admin_panel_keyboard()
-    )
-    await callback.answer()
+    text = "♦ *Ваши тикеты:*\n\n"
+    for t in tickets:
+        status_icon = "🟢" if t[1] == 'open' else "🔴"
+        text += f"{status_icon} #{t[0]} | {t[1]} | {t[2][:16]}\n"
+    
+    text += "\n♦ Нажмите на ID тикета для просмотра"
+    
+    buttons = [[InlineKeyboardButton(text=f"▪ Тикет #{t[0]}", callback_data=f"view_ticket_{t[0]}")] for t in tickets]
+    buttons.append([InlineKeyboardButton(text="♦ Назад", callback_data="back_to_user")])
+    
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
+@dp.callback_query(F.data == "ticket_status")
+async def ticket_status_start(call: types.CallbackQuery, state: FSMContext):
+    await call.message.edit_text("♦ *Введите ID тикета:*")
+    await state.set_state(TicketStates.waiting_ticket_id)
 
-@dp.callback_query(F.data == "admin_add")
-async def admin_add_prompt(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+@dp.message(TicketStates.waiting_ticket_id)
+async def show_ticket_status(msg: types.Message, state: FSMContext):
+    try:
+        ticket_id = int(msg.text)
+        user_id = msg.from_user.id
+        
+        cursor.execute('SELECT * FROM tickets WHERE id = ? AND user_id = ?', (ticket_id, user_id))
+        ticket = cursor.fetchone()
+        
+        if not ticket:
+            await msg.answer("♦ Тикет не найден или это не ваш тикет!")
+            await state.clear()
+            return
+        
+        text = f"♦ *Тикет #{ticket[0]}*\n\n"
+        text += f"▪ Вопрос: {ticket[3]}\n"
+        text += f"▪ Статус: {'🟢 Открыт' if ticket[4] == 'open' else '🔴 Закрыт'}\n"
+        text += f"▪ Создан: {ticket[6][:16]}\n"
+        
+        if ticket[5]:
+            cursor.execute('SELECT username FROM users WHERE user_id = ?', (ticket[5],))
+            helper = cursor.fetchone()
+            text += f"▪ Хелпер: @{helper[0] if helper else ticket[5]}\n"
+        
+        cursor.execute('SELECT message, is_from_helper, created_at FROM messages WHERE ticket_id = ? ORDER BY created_at', (ticket_id,))
+        messages = cursor.fetchall()
+        
+        if messages:
+            text += f"\n♦ *Переписка:*\n"
+            for m in messages:
+                sender = "Хелпер" if m[1] else "Вы"
+                text += f"▪ {sender} [{m[2][11:16]}]: {m[0][:100]}\n"
+        
+        await msg.answer(text, parse_mode="Markdown", reply_markup=user_menu())
+        await state.clear()
+        
+    except ValueError:
+        await msg.answer("♦ Введите число (ID тикета)!")
+        await state.clear()
+
+@dp.callback_query(F.data.startswith("view_ticket_"))
+async def view_ticket(call: types.CallbackQuery):
+    ticket_id = int(call.data.split("_")[2])
+    user_id = call.from_user.id
+    
+    cursor.execute('SELECT * FROM tickets WHERE id = ? AND user_id = ?', (ticket_id, user_id))
+    ticket = cursor.fetchone()
+    
+    if not ticket:
+        await call.answer("Тикет не найден!", show_alert=True)
         return
     
-    await callback.message.answer("➕ Введите username для добавления в базу (без @):")
-    await callback.answer()
-    await state.set_state(AdminAddStates.waiting_for_username)
-
-
-@dp.message(AdminAddStates.waiting_for_username)
-async def admin_add_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    text = f"♦ *Тикет #{ticket[0]}*\n\n"
+    text += f"▪ Вопрос: {ticket[3]}\n"
+    text += f"▪ Статус: {'🟢 Открыт' if ticket[4] == 'open' else '🔴 Закрыт'}\n"
+    text += f"▪ Создан: {ticket[6][:16]}\n"
     
-    if is_in_scambase(username):
-        await message.answer("⚠️ Этот пользователь уже есть в базе!")
+    cursor.execute('SELECT message, is_from_helper, created_at FROM messages WHERE ticket_id = ? ORDER BY created_at', (ticket_id,))
+    messages = cursor.fetchall()
+    
+    if messages:
+        text += f"\n♦ *Переписка:*\n"
+        for m in messages:
+            sender = "Хелпер" if m[1] else "Вы"
+            text += f"▪ {sender} [{m[2][11:16]}]: {m[0][:150]}\n"
+    
+    if ticket[4] == 'open':
+        buttons = [[InlineKeyboardButton(text="♦ Ответить", callback_data=f"user_answer_{ticket_id}")]]
+        buttons.append([InlineKeyboardButton(text="♦ Назад", callback_data="my_tickets")])
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    else:
+        await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♦ Назад", callback_data="my_tickets")]
+        ]))
+
+@dp.callback_query(F.data.startswith("user_answer_"))
+async def user_answer_start(call: types.CallbackQuery, state: FSMContext):
+    ticket_id = int(call.data.split("_")[2])
+    await state.update_data(ticket_id=ticket_id)
+    await call.message.edit_text("♦ *Введите ваш ответ:*")
+    await state.set_state(TicketStates.waiting_answer)
+
+@dp.message(TicketStates.waiting_answer)
+async def user_send_answer(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data['ticket_id']
+    user_id = msg.from_user.id
+    message_text = msg.text
+    
+    cursor.execute('SELECT * FROM tickets WHERE id = ?', (ticket_id,))
+    ticket = cursor.fetchone()
+    
+    if not ticket or ticket[4] != 'open':
+        await msg.answer("♦ Тикет закрыт! Вы не можете отвечать.")
         await state.clear()
         return
     
-    await state.update_data(add_username=username)
-    await message.answer(
-        "🏷️ Выберите метку для пользователя:",
-        reply_markup=label_keyboard(username, "add")
-    )
-    await state.clear()
-
-
-@dp.callback_query(F.data.startswith("add_label_"))
-async def admin_add_with_label(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
+    cursor.execute('''
+        INSERT INTO messages (ticket_id, user_id, message, is_from_helper, created_at)
+        VALUES (?, ?, ?, 0, ?)
+    ''', (ticket_id, user_id, message_text, datetime.now()))
+    conn.commit()
     
-    parts = callback.data.split("_")
-    username = parts[2]
-    label = parts[3]
+    await msg.answer("♦ Сообщение отправлено хелперу!", reply_markup=user_menu())
     
-    if add_to_scambase(username, label, callback.from_user.id):
-        await callback.message.answer(f"✅ Пользователь @{username} добавлен в ScamBase с меткой {label}!")
-    else:
-        await callback.message.answer(f"❌ Ошибка при добавлении пользователя @{username}.")
-    
-    await callback.answer()
-    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
-
-
-@dp.callback_query(F.data == "admin_remove")
-async def admin_remove_prompt(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    await callback.message.answer("❌ Введите username для удаления из базы (без @):")
-    await callback.answer()
-    await state.set_state(AdminRemoveStates.waiting_for_username)
-
-
-@dp.message(AdminRemoveStates.waiting_for_username)
-async def admin_remove_user(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
-    
-    if remove_from_scambase(username):
-        await message.answer(f"✅ Пользователь @{username} удалён из ScamBase!")
-    else:
-        await message.answer(f"❌ Пользователь @{username} не найден в базе.")
+    helper_id = ticket[5]
+    if helper_id:
+        try:
+            await bot.send_message(
+                helper_id,
+                f"♦ *Новый ответ в тикете #{ticket_id}*\n\n"
+                f"▪ От пользователя @{msg.from_user.username or user_id}\n"
+                f"▪ Сообщение: {message_text[:200]}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="♦ Ответить", callback_data=f"answer_ticket_{ticket_id}")]
+                ])
+            )
+        except:
+            pass
     
     await state.clear()
-    await message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
 
+# ========== ХЕЛПЕРСКИЕ ФУНКЦИИ ==========
+@dp.message(Command("help"))
+async def help_cmd(msg: types.Message):
+    user_id = msg.from_user.id
+    if is_helper(user_id) or user_id == ADMIN_ID:
+        await send_with_image(msg.chat.id, "♦ *Панель хелпера*", reply_markup=helper_menu())
+    else:
+        await msg.answer("♦ У вас нет доступа к панели хелпера!")
 
-@dp.callback_query(F.data == "admin_label")
-async def admin_label_prompt(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+@dp.callback_query(F.data == "open_tickets")
+async def open_tickets(call: types.CallbackQuery):
+    if not is_helper(call.from_user.id) and call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
         return
     
-    await callback.message.answer("🏷️ Введите username для изменения метки (без @):")
-    await callback.answer()
-    await state.set_state("waiting_label_username")
-
-
-@dp.message(StateFilter("waiting_label_username"))
-async def admin_label_get_username(message: Message, state: FSMContext):
-    username = message.text.strip().replace('@', '')
+    cursor.execute('SELECT id, username, question, created_at FROM tickets WHERE status = "open" ORDER BY created_at ASC')
+    tickets = cursor.fetchall()
     
-    if not is_in_scambase(username):
-        await message.answer("❌ Пользователь не найден в базе!")
+    if not tickets:
+        await call.answer("Нет открытых тикетов", show_alert=True)
+        return
+    
+    text = "♦ *Открытые тикеты:*\n\n"
+    for t in tickets:
+        text += f"▪ #{t[0]} | @{t[1]} | {t[3][:16]}\n"
+        text += f"   {t[2][:80]}...\n\n"
+    
+    buttons = [[InlineKeyboardButton(text=f"▪ Ответить на #{t[0]}", callback_data=f"answer_ticket_{t[0]}")] for t in tickets]
+    buttons.append([InlineKeyboardButton(text="♦ Назад", callback_data="back_to_helper")])
+    
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data == "my_helper_tickets")
+async def my_helper_tickets(call: types.CallbackQuery):
+    helper_id = call.from_user.id
+    
+    cursor.execute('''
+        SELECT id, username, question, status, created_at FROM tickets 
+        WHERE helper_id = ? 
+        ORDER BY created_at DESC
+    ''', (helper_id,))
+    tickets = cursor.fetchall()
+    
+    if not tickets:
+        await call.answer("У вас нет назначенных тикетов", show_alert=True)
+        return
+    
+    text = "♦ *Ваши тикеты:*\n\n"
+    for t in tickets:
+        status = "🟢" if t[3] == 'open' else "🔴"
+        text += f"{status} #{t[0]} | @{t[1]} | {t[4][:16]}\n"
+    
+    buttons = [[InlineKeyboardButton(text=f"▪ Ответить на #{t[0]}", callback_data=f"answer_ticket_{t[0]}")] for t in tickets]
+    buttons.append([InlineKeyboardButton(text="♦ Назад", callback_data="back_to_helper")])
+    
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data.startswith("answer_ticket_"))
+async def answer_ticket_start(call: types.CallbackQuery, state: FSMContext):
+    if not is_helper(call.from_user.id) and call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
+    
+    ticket_id = int(call.data.split("_")[2])
+    helper_id = call.from_user.id
+    
+    cursor.execute('SELECT * FROM tickets WHERE id = ?', (ticket_id,))
+    ticket = cursor.fetchone()
+    
+    if not ticket:
+        await call.answer("Тикет не найден!", show_alert=True)
+        return
+    
+    if ticket[4] != 'open':
+        await call.answer("Тикет закрыт!", show_alert=True)
+        return
+    
+    if not ticket[5]:
+        cursor.execute('UPDATE tickets SET helper_id = ? WHERE id = ?', (helper_id, ticket_id))
+        conn.commit()
+    
+    await state.update_data(ticket_id=ticket_id)
+    await call.message.edit_text(f"♦ *Отвечаем на тикет #{ticket_id}*\n\nВведите ваш ответ:")
+    await state.set_state(TicketStates.waiting_answer)
+
+@dp.message(TicketStates.waiting_answer)
+async def helper_send_answer(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data['ticket_id']
+    helper_id = msg.from_user.id
+    message_text = msg.text
+    
+    cursor.execute('SELECT user_id, status FROM tickets WHERE id = ?', (ticket_id,))
+    ticket = cursor.fetchone()
+    
+    if not ticket or ticket[1] != 'open':
+        await msg.answer("♦ Тикет закрыт!")
         await state.clear()
         return
     
-    await state.update_data(label_username=username)
-    await message.answer(
-        f"🏷️ Выберите новую метку для @{username}:",
-        reply_markup=label_keyboard(username, "change")
-    )
+    cursor.execute('''
+        INSERT INTO messages (ticket_id, user_id, message, is_from_helper, created_at)
+        VALUES (?, ?, ?, 1, ?)
+    ''', (ticket_id, helper_id, message_text, datetime.now()))
+    conn.commit()
+    
+    cursor.execute('UPDATE tickets SET updated_at = ? WHERE id = ?', (datetime.now(), ticket_id))
+    conn.commit()
+    
+    await msg.answer(f"♦ Ответ отправлен пользователю!", reply_markup=helper_menu())
+    
+    user_id = ticket[0]
+    try:
+        await bot.send_message(
+            user_id,
+            f"♦ *Ответ на ваш тикет #{ticket_id}*\n\n"
+            f"▪ Сообщение: {message_text[:200]}\n\n"
+            f"Вы можете ответить в разделе «Мои тикеты»",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="♦ Посмотреть тикет", callback_data=f"view_ticket_{ticket_id}")]
+            ])
+        )
+    except:
+        pass
+    
     await state.clear()
 
-
-@dp.callback_query(F.data.startswith("change_label_"))
-async def admin_change_label(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+@dp.callback_query(F.data == "close_ticket")
+async def close_ticket_start(call: types.CallbackQuery, state: FSMContext):
+    if not is_helper(call.from_user.id) and call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
         return
     
-    parts = callback.data.split("_")
-    username = parts[2]
-    new_label = parts[3]
+    await call.message.edit_text("♦ *Введите ID тикета для закрытия:*")
+    await state.set_state(TicketStates.waiting_ticket_id)
+
+@dp.callback_query(F.data == "reopen_ticket")
+async def reopen_ticket_start(call: types.CallbackQuery, state: FSMContext):
+    if not is_helper(call.from_user.id) and call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
     
-    if update_label(username, new_label):
-        await callback.message.answer(f"✅ Метка для @{username} изменена на {new_label}!")
+    await call.message.edit_text("♦ *Введите ID тикета для открытия:*")
+    await state.set_state(TicketStates.waiting_ticket_id)
+
+@dp.message(TicketStates.waiting_ticket_id)
+async def process_ticket_action(msg: types.Message, state: FSMContext):
+    try:
+        ticket_id = int(msg.text)
+        
+        cursor.execute('SELECT status FROM tickets WHERE id = ?', (ticket_id,))
+        ticket = cursor.fetchone()
+        
+        if not ticket:
+            await msg.answer("♦ Тикет не найден!")
+            await state.clear()
+            return
+        
+        new_status = 'closed' if ticket[0] == 'open' else 'open'
+        cursor.execute('UPDATE tickets SET status = ?, updated_at = ? WHERE id = ?', (new_status, datetime.now(), ticket_id))
+        conn.commit()
+        
+        action = "закрыт" if new_status == 'closed' else "открыт"
+        await msg.answer(f"♦ Тикет #{ticket_id} {action}!", reply_markup=helper_menu())
+        
+        cursor.execute('SELECT user_id FROM tickets WHERE id = ?', (ticket_id,))
+        user = cursor.fetchone()
+        if user:
+            try:
+                await bot.send_message(
+                    user[0],
+                    f"♦ Ваш тикет #{ticket_id} был {action} хелпером."
+                )
+            except:
+                pass
+        
+        await state.clear()
+        
+    except ValueError:
+        await msg.answer("♦ Введите число (ID тикета)!")
+        await state.clear()
+
+# ========== АДМИНСКИЕ ФУНКЦИИ ==========
+@dp.message(Command("admin"))
+async def admin_cmd(msg: types.Message):
+    if msg.from_user.id == ADMIN_ID:
+        await send_with_image(msg.chat.id, "♦ *Панель администратора*", reply_markup=admin_menu())
     else:
-        await callback.message.answer(f"❌ Ошибка: пользователь @{username} не найден.")
-    
-    await callback.answer()
-    await callback.message.answer("👑 Админ-панель:", reply_markup=admin_panel_keyboard())
+        await msg.answer("♦ Нет доступа!")
 
-
-@dp.callback_query(F.data == "admin_reports")
-async def admin_show_reports(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
+@dp.callback_query(F.data == "list_helpers")
+async def list_helpers(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
         return
     
-    reports = get_pending_reports()
+    cursor.execute('SELECT user_id, username FROM users WHERE is_helper = 1')
     
-    if not reports:
-        await callback.message.answer("📭 Нет ожидающих заявок.")
-        await callback.answer()
-        return
-    
-    for report in reports:
-        report_id, username, reported_by, photos, videos, date = report
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Одобрить (Scammer)", callback_data=f"approve_{report_id}_{username}_Scammer"),
-                InlineKeyboardButton(text="✅ Одобрить (Face)", callback_data=f"approve_{report_id}_{username}_Face"),
-                InlineKeyboardButton(text="✅ Одобрить (Worker)", callback_data=f"approve_{report_id}_{username}_Worker")
-            ],
-            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_{report_id}")]
-        ])
-        
-        text = f"📋 <b>Заявка #{report_id}</b>\n"
-        text += f"👤 Username: @{username}\n"
-        text += f"👮 Подал: ID {reported_by}\n"
-        text += f"📅 Дата: {date[:19]}\n"
-        text += f"📸 Фото: {len(photos.split(',')) if photos else 0}\n"
-        text += f"🎥 Видео: {len(videos.split(',')) if videos else 0}\n"
-        
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=keyboard)
-    
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("approve_"))
-async def admin_approve_report(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    parts = callback.data.split("_")
-    report_id = int(parts[1])
-    username = parts[2]
-    label = parts[3]
-    
-    approve_report(report_id, username, label, callback.from_user.id)
-    
-    await callback.message.answer(f"✅ Заявка #{report_id} одобрена! @{username} добавлен в базу с меткой {label}.")
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("reject_"))
-async def admin_reject_report(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("⛔ Доступ запрещён!", show_alert=True)
-        return
-    
-    report_id = int(callback.data.split("_")[1])
-    reject_report(report_id)
-    
-    await callback.message.answer(f"❌ Заявка #{report_id} отклонена.")
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    is_admin_user = callback.from_user.id in ADMIN_IDS
-    await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard(is_admin_user))
-    await callback.answer()
-
-
-# ================= ЗАПУСК БОТА =================
-async def main():
-    init_db()
-    print("✅ Бот ScamBase запущен!")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
