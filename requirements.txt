@@ -1,2 +1,1 @@
-pyTelegramBotAPI==4.16.1
-tinydb==4.8.0
+aiogram==3.4.1
