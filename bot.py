@@ -9,11 +9,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import sqlite3
 import os
 
-# ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8750633312:AAEBwJ2dyno_elQFUPNBeogYWSWj43pvCTQ"  # ВСТАВЬТЕ ВАШ ТОКЕН
+BOT_TOKEN = "8750633312:AAEBwJ2dyno_elQFUPNBeogYWSWj43pvCTQ"
 ADMIN_ID = 7673683792
 
-# ========== БАЗА ДАННЫХ ==========
 conn = sqlite3.connect('support_bot.db', check_same_thread=False)
 cursor = conn.cursor()
 
@@ -50,7 +48,6 @@ def init_db():
         )
     ''')
     
-    # Добавляем админа
     cursor.execute('SELECT * FROM users WHERE user_id = ?', (ADMIN_ID,))
     if not cursor.fetchone():
         cursor.execute('INSERT INTO users (user_id, username, is_helper) VALUES (?, ?, ?)', 
@@ -65,20 +62,17 @@ bot = Bot(token=BOT_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
-# ========== СОСТОЯНИЯ ==========
 class TicketStates(StatesGroup):
     waiting_question = State()
     waiting_answer = State()
     waiting_ticket_id = State()
     waiting_helper_id = State()
 
-# ========== ПРОВЕРКА ПРАВ ==========
 def is_helper(user_id):
     cursor.execute('SELECT is_helper FROM users WHERE user_id = ?', (user_id,))
     row = cursor.fetchone()
     return row is not None and row[0] == 1
 
-# ========== МЕНЮ ==========
 def user_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Создать тикет", callback_data="create_ticket")],
@@ -104,7 +98,6 @@ def admin_menu():
         [InlineKeyboardButton(text="👤 Ответственный", callback_data="ticket_helper")]
     ])
 
-# ========== СТАРТ ==========
 @dp.message(Command("start"))
 async def start(msg: types.Message):
     user_id = msg.from_user.id
@@ -137,7 +130,6 @@ async def admin_cmd(msg: types.Message):
     else:
         await msg.answer("❌ Нет доступа!")
 
-# ========== ПОЛЬЗОВАТЕЛЬ ==========
 @dp.callback_query(F.data == "create_ticket")
 async def create_ticket(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("📝 *Опишите вашу проблему:*\n\n(Максимум 500 символов)", parse_mode="Markdown")
@@ -170,7 +162,6 @@ async def save_ticket(msg: types.Message, state: FSMContext):
         reply_markup=user_menu()
     )
     
-    # Уведомляем хелперов
     cursor.execute('SELECT user_id FROM users WHERE is_helper = 1')
     helpers = cursor.fetchall()
     for helper in helpers:
@@ -223,46 +214,6 @@ async def ticket_status_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("🔢 *Введите ID тикета:*", parse_mode="Markdown")
     await state.set_state(TicketStates.waiting_ticket_id)
 
-@dp.message(TicketStates.waiting_ticket_id)
-async def show_ticket_status(msg: types.Message, state: FSMContext):
-    try:
-        ticket_id = int(msg.text)
-        user_id = msg.from_user.id
-        
-        cursor.execute('SELECT * FROM tickets WHERE id = ? AND user_id = ?', (ticket_id, user_id))
-        ticket = cursor.fetchone()
-        
-        if not ticket:
-            await msg.answer("❌ Тикет не найден или это не ваш тикет!")
-            await state.clear()
-            return
-        
-        text = f"📌 *Тикет #{ticket[0]}*\n\n"
-        text += f"Вопрос: {ticket[3]}\n"
-        text += f"Статус: {'🟢 Открыт' if ticket[4] == 'open' else '🔴 Закрыт'}\n"
-        text += f"Создан: {ticket[6][:16]}\n"
-        
-        if ticket[5]:
-            cursor.execute('SELECT username FROM users WHERE user_id = ?', (ticket[5],))
-            helper = cursor.fetchone()
-            text += f"Хелпер: @{helper[0] if helper else ticket[5]}\n"
-        
-        cursor.execute('SELECT message, is_from_helper, created_at FROM messages WHERE ticket_id = ? ORDER BY created_at', (ticket_id,))
-        messages = cursor.fetchall()
-        
-        if messages:
-            text += f"\n📝 *Переписка:*\n"
-            for m in messages:
-                sender = "Хелпер" if m[1] else "Вы"
-                text += f"▫️ {sender} [{m[2][11:16]}]: {m[0][:100]}\n"
-        
-        await msg.answer(text, parse_mode="Markdown", reply_markup=user_menu())
-        await state.clear()
-        
-    except ValueError:
-        await msg.answer("❌ Введите число (ID тикета)!")
-        await state.clear()
-
 @dp.callback_query(F.data.startswith("view_ticket_"))
 async def view_ticket(call: types.CallbackQuery):
     ticket_id = int(call.data.split("_")[2])
@@ -305,7 +256,6 @@ async def user_answer_start(call: types.CallbackQuery, state: FSMContext):
     await call.message.edit_text("📝 *Введите ваш ответ:*", parse_mode="Markdown")
     await state.set_state(TicketStates.waiting_answer)
 
-# ========== ХЕЛПЕР ==========
 @dp.callback_query(F.data == "open_tickets")
 async def open_tickets(call: types.CallbackQuery):
     if not is_helper(call.from_user.id) and call.from_user.id != ADMIN_ID:
@@ -422,7 +372,6 @@ async def process_answer(msg: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    # Определяем, кто отвечает (хелпер или пользователь)
     is_helper_answer = is_helper(user_id) or user_id == ADMIN_ID
     
     cursor.execute('''
@@ -434,11 +383,12 @@ async def process_answer(msg: types.Message, state: FSMContext):
     cursor.execute('UPDATE tickets SET updated_at = ? WHERE id = ?', (now, ticket_id))
     conn.commit()
     
-    await msg.answer("✅ Сообщение отправлено!", reply_markup=helper_menu() if is_helper_answer else user_menu())
-    
-    # Отправляем уведомление другой стороне
     if is_helper_answer:
-        # Отправляем пользователю
+        await msg.answer("✅ Ответ отправлен пользователю!", reply_markup=helper_menu())
+    else:
+        await msg.answer("✅ Сообщение отправлено хелперу!", reply_markup=user_menu())
+    
+    if is_helper_answer:
         try:
             await bot.send_message(
                 ticket[0],
@@ -453,7 +403,6 @@ async def process_answer(msg: types.Message, state: FSMContext):
         except:
             pass
     else:
-        # Отправляем хелперам
         cursor.execute('SELECT user_id FROM users WHERE is_helper = 1')
         helpers = cursor.fetchall()
         for helper in helpers:
@@ -473,7 +422,6 @@ async def process_answer(msg: types.Message, state: FSMContext):
     
     await state.clear()
 
-# ========== АДМИН ==========
 @dp.callback_query(F.data == "list_helpers")
 async def list_helpers(call: types.CallbackQuery):
     if call.from_user.id != ADMIN_ID:
@@ -509,9 +457,55 @@ async def remove_helper_start(call: types.CallbackQuery, state: FSMContext):
     await state.set_state(TicketStates.waiting_helper_id)
     await state.update_data(action="remove")
 
-@dp.message(TicketStates.waiting_helper_id)
-async def process_helper_action(msg: types.Message, state: FSMContext):
-    try:
-        helper_id = int(msg.text)
-        data = await state.get_data()
-        acti
+@dp.callback_query(F.data == "all_tickets")
+async def all_tickets_admin(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
+    
+    cursor.execute('SELECT id, username, status, created_at FROM tickets ORDER BY created_at DESC')
+    tickets = cursor.fetchall()
+    
+    if not tickets:
+        await call.answer("Нет тикетов", show_alert=True)
+        return
+    
+    text = "📋 *Все тикеты:*\n\n"
+    for t in tickets:
+        status = "🟢" if t[2] == 'open' else "🔴"
+        text += f"{status} #{t[0]} | @{t[1]} | {t[2]} | {t[3][:16]}\n"
+    
+    buttons = [[InlineKeyboardButton(text=f"📌 Тикет #{t[0]}", callback_data=f"admin_view_ticket_{t[0]}")] for t in tickets[:20]]
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_admin")])
+    
+    await call.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+@dp.callback_query(F.data == "admin_delete_ticket")
+async def admin_delete_ticket_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await call.message.edit_text("🗑 *Введите ID тикета для удаления:*", parse_mode="Markdown")
+    await state.set_state(TicketStates.waiting_ticket_id)
+    await state.update_data(action="admin_delete")
+
+@dp.callback_query(F.data == "ticket_helper")
+async def ticket_helper_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
+    
+    await call.message.edit_text("👤 *Введите ID тикета для просмотра ответственного:*", parse_mode="Markdown")
+    await state.set_state(TicketStates.waiting_ticket_id)
+    await state.update_data(action="ticket_helper")
+
+@dp.callback_query(F.data.startswith("admin_view_ticket_"))
+async def admin_view_ticket(call: types.CallbackQuery):
+    if call.from_user.id != ADMIN_ID:
+        await call.answer("Нет доступа!", show_alert=True)
+        return
+    
+    ticket_id = int(call.data.split("_")[3])
+    
+    cursor.execute('SELECT * FROM tickets WHERE id = 
