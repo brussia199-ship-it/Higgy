@@ -18,6 +18,10 @@ BOT_TOKEN = "8830098882:AAEQVdiWSpcNhV4vZk5dxtIZ7Hj4lnCU3Qw"
 CRYPTOBOT_TOKEN = "583403:AAfrNWLb7jwLrPAIQavMgItheP4X3X5GthY"  # Получите у @CryptoBot
 ADMIN_ID = 7673683792
 
+# Настройки
+MIN_DEAL_AMOUNT = 0.5  # Минимальная сумма сделки в USDT
+CURRENCY = "USDT"  # Валюта
+
 # ========== БАЗА ДАННЫХ ==========
 db = sqlite3.connect("guarantee_bot.db", check_same_thread=False)
 cursor = db.cursor()
@@ -28,6 +32,8 @@ CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
     balance REAL DEFAULT 0,
+    total_spent REAL DEFAULT 0,
+    total_earned REAL DEFAULT 0,
     registered_at TIMESTAMP
 );
 
@@ -77,6 +83,7 @@ db.commit()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def generate_deal_tag() -> str:
+    """Генерация уникального тега для сделки #00:AABBCC"""
     hex_part = ''.join(random.choices('0123456789ABCDEF', k=6))
     return f"#{random.randint(10,99)}:{hex_part}"
 
@@ -84,8 +91,9 @@ def get_commission() -> float:
     cursor.execute("SELECT value FROM admin_settings WHERE key='commission'")
     return float(cursor.fetchone()[0])
 
-def format_balance(amount: float) -> str:
-    return f"{amount:.2f} RUB"
+def format_amount(amount: float) -> str:
+    """Форматирование суммы с 2 знаками после запятой"""
+    return f"{amount:.2f} {CURRENCY}"
 
 def get_deal_status_text(status: str) -> str:
     statuses = {
@@ -97,9 +105,10 @@ def get_deal_status_text(status: str) -> str:
     }
     return statuses.get(status, status)
 
-async def create_crypto_invoice(amount_rub: float) -> Tuple[Optional[str], Optional[str]]:
-    """Создание инвойса через CryptoBot API"""
+async def create_crypto_invoice(amount_usdt: float) -> Tuple[Optional[str], Optional[str]]:
+    """Создание инвойса через CryptoBot API в USDT"""
     if not CRYPTOBOT_TOKEN or CRYPTOBOT_TOKEN == "ВАШ_CRYPTOBOT_TOKEN":
+        print("CryptoBot token not configured")
         return None, None
     
     url = "https://pay.crypt.bot/api/createInvoice"
@@ -109,15 +118,16 @@ async def create_crypto_invoice(amount_rub: float) -> Tuple[Optional[str], Optio
     }
     data = {
         "asset": "USDT",
-        "amount": str(amount_rub),
+        "amount": str(amount_usdt),
         "paid_btn_name": "callback",
         "paid_btn_url": f"https://t.me/{BOT_TOKEN.split(':')[0]}",
-        "description": f"Оплата сделки-гаранта"
+        "description": f"Оплата сделки-гаранта UralGarant"
     }
     
     try:
         response = requests.post(url, headers=headers, json=data, timeout=15)
         result = response.json()
+        print(f"CryptoBot response: {result}")
         if result.get("ok"):
             return result["result"]["invoice_id"], result["result"]["pay_url"]
         return None, None
@@ -146,7 +156,7 @@ def main_menu(user_id: int) -> InlineKeyboardMarkup:
     # Получаем баланс пользователя
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
     balance = cursor.fetchone()
-    balance_text = format_balance(balance[0]) if balance else "0.00 RUB"
+    balance_text = format_amount(balance[0]) if balance else f"0.00 {CURRENCY}"
     
     buttons = [
         [InlineKeyboardButton(text="➕ Создать сделку", callback_data="create_deal")],
@@ -164,10 +174,11 @@ def admin_panel() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💰 Установить комиссию", callback_data="admin_commission")],
         [InlineKeyboardButton(text="📋 Все сделки", callback_data="admin_deals")],
         [InlineKeyboardButton(text="🔄 Сбросить статус сделки", callback_data="admin_reset_deal")],
-        [InlineKeyboardButton(text="💬 Просмотр чатов сделок", callback_data="admin_watch_chat")],
+        [InlineKeyboardButton(text="💬 Просмотр чатов", callback_data="admin_watch_chat")],
         [InlineKeyboardButton(text="📤 Заявки на вывод", callback_data="admin_withdraws")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="➕ Ручное начисление", callback_data="admin_manual_balance")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
     ])
 
@@ -187,6 +198,8 @@ class AdminState(StatesGroup):
     waiting_deal_id = State()
     waiting_reset_deal = State()
     waiting_support_reply = State()
+    waiting_manual_user = State()
+    waiting_manual_amount = State()
 
 class SupportState(StatesGroup):
     waiting_message = State()
@@ -206,15 +219,15 @@ async def cmd_start(message: Message):
     
     await message.answer(
         f"🤝 *Добро пожаловать в UralGarant!*\n\n"
-        f"🔐 *Сервис гарант-сделок*\n\n"
+        f"🔐 *Сервис гарант-сделок в {CURRENCY}*\n\n"
+        f"💰 Минимальная сделка: {format_amount(MIN_DEAL_AMOUNT)}\n\n"
         f"Я помогаю безопасно проводить сделки между продавцом и покупателем.\n\n"
-        f"💰 Деньги блокируются на счете гаранта до подтверждения покупателя.\n\n"
         f"📌 *Как это работает:*\n"
         f"1️⃣ Покупатель создает сделку\n"
-        f"2️⃣ Оплачивает через CryptoBot\n"
+        f"2️⃣ Оплачивает через CryptoBot (USDT)\n"
         f"3️⃣ Продавец выполняет обязательства\n"
         f"4️⃣ Покупатель подтверждает получение\n"
-        f"5️⃣ Продавец получает деньги\n\n"
+        f"5️⃣ Продавец получает {CURRENCY} на баланс\n\n"
         f"Используйте кнопки для навигации:",
         reply_markup=main_menu(user_id),
         parse_mode="Markdown"
@@ -228,28 +241,36 @@ async def back_to_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "show_balance")
 async def show_balance(callback: CallbackQuery):
-    cursor.execute("SELECT balance FROM users WHERE user_id=?", (callback.from_user.id,))
-    balance = cursor.fetchone()[0]
-    await callback.answer(f"Ваш баланс: {format_balance(balance)}", show_alert=True)
+    cursor.execute("SELECT balance, total_spent, total_earned FROM users WHERE user_id=?", (callback.from_user.id,))
+    balance, spent, earned = cursor.fetchone()
+    await callback.answer(
+        f"💰 *Ваш баланс:*\n\n"
+        f"Доступно: {format_amount(balance)}\n"
+        f"Всего потрачено: {format_amount(spent or 0)}\n"
+        f"Всего заработано: {format_amount(earned or 0)}",
+        show_alert=True,
+        parse_mode="Markdown"
+    )
 
 # ========== СОЗДАНИЕ СДЕЛКИ ==========
 @dp.callback_query(F.data == "create_deal")
 async def create_deal_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("💰 Введите сумму сделки в рублях (мин. 100 RUB):")
+    await callback.message.answer(f"💰 Введите сумму сделки в {CURRENCY} (мин. {format_amount(MIN_DEAL_AMOUNT)}):")
     await state.set_state(CreateDeal.waiting_for_amount)
     await callback.answer()
 
 @dp.message(CreateDeal.waiting_for_amount)
 async def process_amount(message: Message, state: FSMContext):
     try:
-        amount = float(message.text)
-        if amount < 100:
-            raise ValueError
+        amount = float(message.text.replace(',', '.'))
+        if amount < MIN_DEAL_AMOUNT:
+            await message.answer(f"❌ Минимальная сумма сделки: {format_amount(MIN_DEAL_AMOUNT)}")
+            return
         await state.update_data(amount=amount)
         await message.answer("👤 Введите ID продавца (кому переведут деньги):\n\nПример: `7804485863`", parse_mode="Markdown")
         await state.set_state(CreateDeal.waiting_for_partner_id)
-    except:
-        await message.answer("❌ Неверная сумма! Минимум 100 RUB. Попробуйте снова:")
+    except ValueError:
+        await message.answer(f"❌ Введите корректную сумму в {CURRENCY} (например: 100.50)")
 
 @dp.message(CreateDeal.waiting_for_partner_id)
 async def process_partner(message: Message, state: FSMContext):
@@ -289,7 +310,7 @@ async def process_partner(message: Message, state: FSMContext):
     await message.answer(
         f"✅ *Сделка создана!*\n\n"
         f"📌 Тег: `{tag}`\n"
-        f"💰 Сумма: {format_balance(amount)}\n"
+        f"💰 Сумма: {format_amount(amount)}\n"
         f"👤 Продавец: `{partner_id}`\n"
         f"👤 Покупатель: `{message.from_user.id}`\n"
         f"💸 Комиссия: {commission}%\n\n"
@@ -305,7 +326,7 @@ async def process_partner(message: Message, state: FSMContext):
             partner_id,
             f"🆕 *Новая сделка!*\n\n"
             f"📌 Тег: `{tag}`\n"
-            f"💰 Сумма: {format_balance(amount)}\n"
+            f"💰 Сумма: {format_amount(amount)}\n"
             f"👤 Покупатель: `{message.from_user.id}`\n\n"
             f"Ожидайте оплаты от покупателя.\n"
             f"После оплаты вы получите уведомление.",
@@ -357,12 +378,19 @@ async def pay_deal(callback: CallbackQuery):
             return
     
     # Создаем новый инвойс
-    await callback.message.answer("🔄 Создаю платеж...")
+    await callback.message.answer("🔄 Создаю платеж в USDT...")
     
     invoice_id_new, pay_url_new = await create_crypto_invoice(amount)
     
     if not invoice_id_new:
-        await callback.message.answer("❌ *Ошибка создания платежа*\n\nОбратитесь к администратору.", parse_mode="Markdown")
+        await callback.message.answer(
+            "❌ *Ошибка создания платежа*\n\n"
+            "Пожалуйста, сообщите администратору о проблеме.\n"
+            "Возможные причины:\n"
+            "- Не настроен CryptoBot токен\n"
+            "- Проблемы с соединением",
+            parse_mode="Markdown"
+        )
         await callback.answer()
         return
     
@@ -370,19 +398,19 @@ async def pay_deal(callback: CallbackQuery):
     db.commit()
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url_new)],
+        [InlineKeyboardButton(text="💳 Перейти к оплате USDT", url=pay_url_new)],
         [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment_{deal_id}_{invoice_id_new}")],
         [InlineKeyboardButton(text="💬 Чат с продавцом", callback_data=f"chat_{deal_id}")]
     ])
     
     await callback.message.answer(
         f"💳 *Оплата сделки {tag}*\n\n"
-        f"💰 Сумма: {format_balance(amount)}\n"
+        f"💰 Сумма: {format_amount(amount)}\n"
         f"📌 Комиссия: {commission}%\n\n"
         f"*Инструкция:*\n"
-        f"1️⃣ Нажмите «Перейти к оплате»\n"
-        f"2️⃣ Оплатите через CryptoBot\n"
-        f"3️⃣ Нажмите «Проверить оплату»\n\n"
+        f"1️⃣ Нажмите «Перейти к оплате USDT»\n"
+        f"2️⃣ Оплатите через CryptoBot (USDT)\n"
+        f"3️⃣ После оплаты нажмите «Проверить оплату»\n\n"
         f"⚠️ Деньги будут заморожены до вашего подтверждения.",
         reply_markup=kb,
         parse_mode="Markdown"
@@ -401,6 +429,12 @@ async def check_payment(callback: CallbackQuery):
     
     if inv_status == "paid":
         cursor.execute("UPDATE deals SET status='funded', funded_at=? WHERE deal_id=?", (datetime.now(), deal_id))
+        
+        # Обновляем статистику покупателя
+        cursor.execute("SELECT amount FROM deals WHERE deal_id=?", (deal_id,))
+        amount = cursor.fetchone()[0]
+        cursor.execute("UPDATE users SET total_spent = total_spent + ? WHERE user_id=?", (amount, callback.from_user.id))
+        
         db.commit()
         
         cursor.execute("SELECT tag, seller_id, buyer_id, amount FROM deals WHERE deal_id=?", (deal_id,))
@@ -411,7 +445,7 @@ async def check_payment(callback: CallbackQuery):
             await bot.send_message(
                 deal[1],
                 f"✅ *Сделка {deal[0]} оплачена!*\n\n"
-                f"💰 Сумма: {format_balance(deal[3])}\n"
+                f"💰 Сумма: {format_amount(deal[3])}\n"
                 f"Деньги заморожены до подтверждения покупателя.",
                 parse_mode="Markdown"
             )
@@ -425,16 +459,16 @@ async def check_payment(callback: CallbackQuery):
         
         await callback.message.answer(
             "✅ *Оплата подтверждена!*\n\n"
-            "Деньги заморожены на счете гаранта.\n"
-            "После получения товара нажмите «Подтвердить получение».",
+            f"💰 Сумма {format_amount(deal[3])} заморожена на счете гаранта.\n"
+            "После получения товара/услуги нажмите «Подтвердить получение».",
             reply_markup=kb,
             parse_mode="Markdown"
         )
         
     elif inv_status == "active":
-        await callback.message.answer("⏳ *Платеж еще не оплачен*\n\nОплатите и нажмите проверку снова.", parse_mode="Markdown")
+        await callback.message.answer("⏳ *Платеж еще не оплачен*\n\nОплатите счет и нажмите проверку снова.", parse_mode="Markdown")
     else:
-        await callback.message.answer("❌ *Не удалось проверить платеж*\n\nПопробуйте позже.", parse_mode="Markdown")
+        await callback.message.answer("❌ *Не удалось проверить платеж*\n\nПопробуйте позже или обратитесь к администратору.", parse_mode="Markdown")
     
     await callback.answer()
 
@@ -457,20 +491,21 @@ async def confirm_deal(callback: CallbackQuery):
         return
     
     if callback.from_user.id != buyer_id:
-        await callback.answer("❌ Только покупатель может подтвердить", show_alert=True)
+        await callback.answer("❌ Только покупатель может подтвердить получение", show_alert=True)
         return
     
     seller_payout = amount * (1 - commission / 100)
     
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (seller_payout, seller_id))
+    cursor.execute("UPDATE users SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id=?", 
+                   (seller_payout, seller_payout, seller_id))
     cursor.execute("UPDATE deals SET status='completed', completed_at=? WHERE deal_id=?", (datetime.now(), deal_id))
     db.commit()
     
     await callback.message.answer(
         f"✅ *Сделка успешно завершена!*\n\n"
         f"📌 Тег: {tag}\n"
-        f"💰 Продавцу начислено: {format_balance(seller_payout)}\n"
-        f"💸 Комиссия: {format_balance(amount * commission / 100)}\n\n"
+        f"💰 Продавцу начислено: {format_amount(seller_payout)}\n"
+        f"💸 Комиссия сервиса: {format_amount(amount * commission / 100)}\n\n"
         f"Спасибо за использование сервиса!",
         parse_mode="Markdown"
     )
@@ -479,7 +514,8 @@ async def confirm_deal(callback: CallbackQuery):
         await bot.send_message(
             seller_id,
             f"✅ *Сделка {tag} завершена!*\n\n"
-            f"💰 Вам начислено: {format_balance(seller_payout)}",
+            f"💰 Вам начислено: {format_amount(seller_payout)}\n"
+            f"💸 Комиссия: {commission}%",
             parse_mode="Markdown"
         )
     except:
@@ -580,14 +616,12 @@ async def support_chat(callback: CallbackQuery, state: FSMContext):
 
 @dp.message(SupportState.waiting_message)
 async def process_support_message(message: Message, state: FSMContext):
-    # Сохраняем сообщение в БД
     cursor.execute("""
         INSERT INTO messages (deal_id, from_id, message_text, timestamp)
         VALUES (?, ?, ?, ?)
     """, ("support", message.from_user.id, f"[ПОДДЕРЖКА] {message.text}", datetime.now()))
     db.commit()
     
-    # Отправляем админу
     await bot.send_message(
         ADMIN_ID,
         f"📩 *Новое сообщение в поддержку*\n\n"
@@ -644,15 +678,16 @@ async def withdraw_start(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (callback.from_user.id,))
     balance = cursor.fetchone()[0]
     
-    if balance < 100:
-        await callback.answer(f"❌ Минимальная сумма вывода 100 RUB. Ваш баланс: {format_balance(balance)}", show_alert=True)
+    if balance < MIN_DEAL_AMOUNT:
+        await callback.answer(f"❌ Минимальная сумма вывода {format_amount(MIN_DEAL_AMOUNT)}. Ваш баланс: {format_amount(balance)}", show_alert=True)
         return
     
     await callback.message.answer(
-        f"💰 *Вывод средств*\n\n"
-        f"Ваш баланс: {format_balance(balance)}\n"
-        f"Мин. сумма: 100 RUB\n\n"
-        f"Введите сумму вывода:",
+        f"💰 *Вывод средств ({CURRENCY})*\n\n"
+        f"Ваш баланс: {format_amount(balance)}\n"
+        f"Мин. сумма: {format_amount(MIN_DEAL_AMOUNT)}\n"
+        f"Комиссия за вывод: 0%\n\n"
+        f"Введите сумму вывода в {CURRENCY}:",
         parse_mode="Markdown"
     )
     await state.set_state(WithdrawState.waiting_for_amount)
@@ -661,22 +696,22 @@ async def withdraw_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(WithdrawState.waiting_for_amount)
 async def withdraw_amount(message: Message, state: FSMContext):
     try:
-        amount = float(message.text)
+        amount = float(message.text.replace(',', '.'))
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
         balance = cursor.fetchone()[0]
         
-        if amount < 100:
-            await message.answer("❌ Минимальная сумма вывода 100 RUB")
+        if amount < MIN_DEAL_AMOUNT:
+            await message.answer(f"❌ Минимальная сумма вывода {format_amount(MIN_DEAL_AMOUNT)}")
             return
         if amount > balance:
-            await message.answer(f"❌ Недостаточно средств. Ваш баланс: {format_balance(balance)}")
+            await message.answer(f"❌ Недостаточно средств. Ваш баланс: {format_amount(balance)}")
             return
         
         await state.update_data(amount=amount)
         await message.answer("💳 Введите адрес кошелька USDT (TRC20):\n\nПример: `TX7cqUBeJovQRfZq5YHtT7jqHByL5ZpXtZ`", parse_mode="Markdown")
         await state.set_state(WithdrawState.waiting_for_wallet)
     except ValueError:
-        await message.answer("❌ Введите корректную сумму")
+        await message.answer(f"❌ Введите корректную сумму в {CURRENCY} (например: 50.75)")
 
 @dp.message(WithdrawState.waiting_for_wallet)
 async def withdraw_wallet(message: Message, state: FSMContext):
@@ -685,8 +720,8 @@ async def withdraw_wallet(message: Message, state: FSMContext):
     wallet = message.text.strip()
     
     # Простая проверка адреса TRC20
-    if not wallet.startswith('T') or len(wallet) < 30:
-        await message.answer("❌ Неверный формат адреса TRC20. Попробуйте снова:")
+    if not wallet.startswith('T') or len(wallet) < 30 or len(wallet) > 42:
+        await message.answer("❌ Неверный формат адреса TRC20. Адрес должен начинаться с 'T' и иметь длину 34-42 символа.\nПопробуйте снова:")
         return
     
     cursor.execute("""
@@ -700,20 +735,19 @@ async def withdraw_wallet(message: Message, state: FSMContext):
     await message.answer(
         f"✅ *Заявка на вывод создана!*\n\n"
         f"📤 ID: {withdraw_id}\n"
-        f"💰 Сумма: {format_balance(data['amount'])}\n"
+        f"💰 Сумма: {format_amount(data['amount'])}\n"
         f"💳 Кошелек: `{wallet}`\n\n"
         f"Статус: ⏳ Ожидает обработки\n\n"
         f"Администратор обработает заявку в ближайшее время.",
         parse_mode="Markdown"
     )
     
-    # Уведомляем администратора
     await bot.send_message(
         ADMIN_ID,
-        f"📤 *Новая заявка на вывод*\n\n"
+        f"📤 *Новая заявка на вывод USDT*\n\n"
         f"🆔 ID: {withdraw_id}\n"
         f"👤 Пользователь: {message.from_user.id}\n"
-        f"💰 Сумма: {format_balance(data['amount'])}\n"
+        f"💰 Сумма: {format_amount(data['amount'])}\n"
         f"💳 Кошелек: `{wallet}`\n"
         f"📅 Создана: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
         parse_mode="Markdown",
@@ -748,7 +782,7 @@ async def my_deals(callback: CallbackQuery):
         text = (
             f"┌ *Сделка*\n"
             f"├ 📌 Тег: `{tag}`\n"
-            f"├ 💰 Сумма: {format_balance(amount)}\n"
+            f"├ 💰 Сумма: {format_amount(amount)}\n"
             f"├ 👤 {role}\n"
             f"├ 📅 Создана: {created_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"└ 📊 Статус: {get_deal_status_text(status)}\n"
@@ -822,11 +856,10 @@ async def admin_deals(callback: CallbackQuery):
     
     text = "📋 *Последние 20 сделок:*\n\n"
     for deal in deals:
-        text += f"`{deal[0]}` | {format_balance(deal[1])} | {deal[2]}\n"
+        text += f"`{deal[0]}` | {format_amount(deal[1])} | {deal[2]}\n"
         text += f"└ Продавец: {deal[3]} | Покупатель: {deal[4]}\n"
         text += f"└ Создана: {deal[5].strftime('%d.%m.%Y %H:%M')}\n\n"
     
-    # Разбиваем на части если слишком длинное
     if len(text) > 4000:
         text = text[:4000]
     
@@ -854,18 +887,74 @@ async def admin_stats(callback: CallbackQuery):
     cursor.execute("SELECT COUNT(*) FROM withdraws WHERE status='pending'")
     pending_withdraws = cursor.fetchone()[0]
     
+    cursor.execute("SELECT SUM(amount) FROM withdraws WHERE status='pending'")
+    pending_amount = cursor.fetchone()[0] or 0
+    
     text = (
         f"📊 *Статистика бота*\n\n"
         f"👥 Пользователей: {users_count}\n"
         f"📋 Всего сделок: {total_deals}\n"
         f"✅ Завершенных: {completed_deals}\n"
-        f"💰 Общий объем: {format_balance(total_volume)}\n"
-        f"💸 Заявок на вывод: {pending_withdraws}\n"
-        f"💸 Комиссия: {get_commission()}%"
+        f"💰 Общий объем: {format_amount(total_volume)}\n"
+        f"💸 Заявок на вывод: {pending_withdraws} ({format_amount(pending_amount)})\n"
+        f"💸 Комиссия: {get_commission()}%\n"
+        f"💱 Валюта: {CURRENCY}"
     )
     
     await callback.message.answer(text, parse_mode="Markdown")
     await callback.answer()
+
+@dp.callback_query(F.data == "admin_manual_balance")
+async def manual_balance_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+    
+    await callback.message.answer("➕ *Ручное начисление/списание*\n\nВведите ID пользователя:")
+    await state.set_state(AdminState.waiting_manual_user)
+    await callback.answer()
+
+@dp.message(AdminState.waiting_manual_user)
+async def manual_balance_user(message: Message, state: FSMContext):
+    try:
+        user_id = int(message.text.strip())
+        cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        if not cursor.fetchone():
+            await message.answer("❌ Пользователь не найден")
+            return
+        await state.update_data(manual_user_id=user_id)
+        await message.answer(f"💰 Введите сумму для начисления (положительное число) или списания (отрицательное):\n\nПример: `+50` или `-20`")
+        await state.set_state(AdminState.waiting_manual_amount)
+    except ValueError:
+        await message.answer("❌ Введите корректный ID пользователя")
+
+@dp.message(AdminState.waiting_manual_amount)
+async def manual_balance_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get('manual_user_id')
+    
+    try:
+        amount = float(message.text.replace(',', '.'))
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (amount, user_id))
+        db.commit()
+        
+        action = "начислено" if amount > 0 else "списано"
+        await message.answer(f"✅ Пользователю {user_id} {action} {format_amount(abs(amount))}")
+        
+        try:
+            await bot.send_message(
+                user_id,
+                f"{'➕' if amount > 0 else '➖'} *Изменение баланса*\n\n"
+                f"Вам {action}: {format_amount(abs(amount))}\n"
+                f"Текущий баланс можно проверить в главном меню.",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+        
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
 
 @dp.callback_query(F.data == "admin_reset_deal")
 async def admin_reset_deal(callback: CallbackQuery, state: FSMContext):
@@ -935,10 +1024,10 @@ async def admin_withdraws(callback: CallbackQuery):
     
     for w in withdraws:
         await callback.message.answer(
-            f"📤 *Заявка на вывод*\n\n"
+            f"📤 *Заявка на вывод USDT*\n\n"
             f"🆔 ID: `{w[0]}`\n"
             f"👤 Пользователь: {w[1]}\n"
-            f"💰 Сумма: {format_balance(w[2])}\n"
+            f"💰 Сумма: {format_amount(w[2])}\n"
             f"💳 Кошелек: `{w[3]}`\n"
             f"📅 Создана: {w[4].strftime('%d.%m.%Y %H:%M')}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -978,7 +1067,7 @@ async def reject_withdraw(callback: CallbackQuery):
         db.commit()
         
         try:
-            await bot.send_message(w[0], f"❌ Ваша заявка на вывод {format_balance(w[1])} отклонена. Средства возвращены на баланс.")
+            await bot.send_message(w[0], f"❌ Ваша заявка на вывод {format_amount(w[1])} отклонена. Средства возвращены на баланс.")
         except:
             pass
     
@@ -1078,7 +1167,8 @@ async def cancel_cmd(message: Message, state: FSMContext):
 async def main():
     print("🤖 UralGarant бот запущен!")
     print(f"👑 Администратор: {ADMIN_ID}")
-    print(f"💬 Бот: @{BOT_TOKEN.split(':')[0]}")
+    print(f"💱 Валюта: {CURRENCY}")
+    print(f"💰 Минимальная сделка: {MIN_DEAL_AMOUNT} {CURRENCY}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
