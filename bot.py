@@ -14,11 +14,11 @@ from aiogram.fsm.state import State, StatesGroup
 import requests
 
 # ========== КОНФИГУРАЦИЯ ==========
-BOT_TOKEN = "8830098882:AAEQVdiWSpcNhV4vZk5dxtIZ7Hj4lnCU3Qw"  # Ваш токен
-CRYPTOBOT_TOKEN = "583403:AAfrNWLb7jwLrPAIQavMgItheP4X3X5GthY"  # Токен от @CryptoBot
-ADMIN_ID = 7673683792  # Ваш Telegram ID (один администратор)
+BOT_TOKEN = "8830098882:AAEQVdiWSpcNhV4vZk5dxtIZ7Hj4lnCU3Qw"
+CRYPTOBOT_TOKEN = "583403:AAfrNWLb7jwLrPAIQavMgItheP4X3X5GthY"  # Получите у @CryptoBot
+ADMIN_ID = 7673683792
 
-# ========== БАЗА ДАННЫХ SQLite ==========
+# ========== БАЗА ДАННЫХ ==========
 db = sqlite3.connect("guarantee_bot.db", check_same_thread=False)
 cursor = db.cursor()
 
@@ -41,8 +41,10 @@ CREATE TABLE IF NOT EXISTS deals (
     status TEXT DEFAULT 'pending',
     created_at TIMESTAMP,
     funded_at TIMESTAMP,
+    completed_at TIMESTAMP,
     chat_id INTEGER UNIQUE,
-    invoice_id TEXT
+    invoice_id TEXT,
+    payment_url TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -50,8 +52,7 @@ CREATE TABLE IF NOT EXISTS messages (
     deal_id TEXT,
     from_id INTEGER,
     message_text TEXT,
-    timestamp TIMESTAMP,
-    FOREIGN KEY(deal_id) REFERENCES deals(deal_id)
+    timestamp TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS withdraws (
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS withdraws (
     amount REAL,
     wallet_address TEXT,
     status TEXT DEFAULT 'pending',
-    created_at TIMESTAMP
+    created_at TIMESTAMP,
+    processed_at TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS admin_settings (
@@ -75,7 +77,6 @@ db.commit()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def generate_deal_tag() -> str:
-    """Генерация уникального тега для сделки #00:AABBCC"""
     hex_part = ''.join(random.choices('0123456789ABCDEF', k=6))
     return f"#{random.randint(10,99)}:{hex_part}"
 
@@ -85,6 +86,16 @@ def get_commission() -> float:
 
 def format_balance(amount: float) -> str:
     return f"{amount:.2f} RUB"
+
+def get_deal_status_text(status: str) -> str:
+    statuses = {
+        "pending": "⏳ Ожидает оплаты",
+        "funded": "💎 Средства заморожены",
+        "completed": "✅ Завершена",
+        "disputed": "⚠️ Спор",
+        "closed": "❌ Закрыта"
+    }
+    return statuses.get(status, status)
 
 async def create_crypto_invoice(amount_rub: float) -> Tuple[Optional[str], Optional[str]]:
     """Создание инвойса через CryptoBot API"""
@@ -97,14 +108,15 @@ async def create_crypto_invoice(amount_rub: float) -> Tuple[Optional[str], Optio
         "Content-Type": "application/json"
     }
     data = {
-        "asset": "RUB",
+        "asset": "USDT",
         "amount": str(amount_rub),
         "paid_btn_name": "callback",
-        "paid_btn_url": f"https://t.me/{BOT_TOKEN.split(':')[0]}"
+        "paid_btn_url": f"https://t.me/{BOT_TOKEN.split(':')[0]}",
+        "description": f"Оплата сделки-гаранта"
     }
     
     try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
+        response = requests.post(url, headers=headers, json=data, timeout=15)
         result = response.json()
         if result.get("ok"):
             return result["result"]["invoice_id"], result["result"]["pay_url"]
@@ -113,12 +125,34 @@ async def create_crypto_invoice(amount_rub: float) -> Tuple[Optional[str], Optio
         print(f"CryptoBot error: {e}")
         return None, None
 
+async def check_invoice_status(invoice_id: str) -> str:
+    """Проверка статуса инвойса"""
+    url = "https://pay.crypt.bot/api/getInvoices"
+    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN}
+    params = {"invoice_ids": invoice_id}
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        result = response.json()
+        if result.get("ok") and result["result"]["items"]:
+            return result["result"]["items"][0]["status"]
+        return "invalid"
+    except Exception as e:
+        print(f"Check invoice error: {e}")
+        return "error"
+
 # ========== КЛАВИАТУРЫ ==========
 def main_menu(user_id: int) -> InlineKeyboardMarkup:
+    # Получаем баланс пользователя
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+    balance = cursor.fetchone()
+    balance_text = format_balance(balance[0]) if balance else "0.00 RUB"
+    
     buttons = [
         [InlineKeyboardButton(text="➕ Создать сделку", callback_data="create_deal")],
         [InlineKeyboardButton(text="📋 Мои сделки", callback_data="my_deals")],
-        [InlineKeyboardButton(text="💰 Пополнить баланс", callback_data="deposit")],
+        [InlineKeyboardButton(text="💬 Чат поддержки", callback_data="support_chat")],
+        [InlineKeyboardButton(text=f"💰 Баланс: {balance_text}", callback_data="show_balance")],
         [InlineKeyboardButton(text="💸 Вывод средств", callback_data="withdraw")],
     ]
     if user_id == ADMIN_ID:
@@ -129,9 +163,11 @@ def admin_panel() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Установить комиссию", callback_data="admin_commission")],
         [InlineKeyboardButton(text="📋 Все сделки", callback_data="admin_deals")],
-        [InlineKeyboardButton(text="💬 Чат сделки", callback_data="admin_watch_chat")],
+        [InlineKeyboardButton(text="🔄 Сбросить статус сделки", callback_data="admin_reset_deal")],
+        [InlineKeyboardButton(text="💬 Просмотр чатов сделок", callback_data="admin_watch_chat")],
         [InlineKeyboardButton(text="📤 Заявки на вывод", callback_data="admin_withdraws")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_menu")]
     ])
 
@@ -146,12 +182,16 @@ class WithdrawState(StatesGroup):
 
 class AdminState(StatesGroup):
     waiting_commission = State()
-    waiting_broadcast = State()
     waiting_broadcast_text = State()
     watching_chat = State()
     waiting_deal_id = State()
+    waiting_reset_deal = State()
+    waiting_support_reply = State()
 
-# ========== ОБРАБОТЧИКИ КОМАНД ==========
+class SupportState(StatesGroup):
+    waiting_message = State()
+
+# ========== ОБРАБОТЧИКИ ==========
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -165,18 +205,32 @@ async def cmd_start(message: Message):
     db.commit()
     
     await message.answer(
-        "🤝 *Добро пожаловать в Гарант Бот!*\n\n"
-        "Здесь вы можете безопасно проводить сделки.\n"
-        "Бот выступает гарантом: деньги блокируются до подтверждения покупателя.\n\n"
-        "Используйте кнопки для навигации:",
+        f"🤝 *Добро пожаловать в UralGarant!*\n\n"
+        f"🔐 *Сервис гарант-сделок*\n\n"
+        f"Я помогаю безопасно проводить сделки между продавцом и покупателем.\n\n"
+        f"💰 Деньги блокируются на счете гаранта до подтверждения покупателя.\n\n"
+        f"📌 *Как это работает:*\n"
+        f"1️⃣ Покупатель создает сделку\n"
+        f"2️⃣ Оплачивает через CryptoBot\n"
+        f"3️⃣ Продавец выполняет обязательства\n"
+        f"4️⃣ Покупатель подтверждает получение\n"
+        f"5️⃣ Продавец получает деньги\n\n"
+        f"Используйте кнопки для навигации:",
         reply_markup=main_menu(user_id),
         parse_mode="Markdown"
     )
 
 @dp.callback_query(F.data == "back_to_menu")
 async def back_to_menu(callback: CallbackQuery):
-    await callback.message.edit_text("🏠 *Главное меню:*", reply_markup=main_menu(callback.from_user.id), parse_mode="Markdown")
+    await callback.message.delete()
+    await cmd_start(callback.message)
     await callback.answer()
+
+@dp.callback_query(F.data == "show_balance")
+async def show_balance(callback: CallbackQuery):
+    cursor.execute("SELECT balance FROM users WHERE user_id=?", (callback.from_user.id,))
+    balance = cursor.fetchone()[0]
+    await callback.answer(f"Ваш баланс: {format_balance(balance)}", show_alert=True)
 
 # ========== СОЗДАНИЕ СДЕЛКИ ==========
 @dp.callback_query(F.data == "create_deal")
@@ -192,7 +246,7 @@ async def process_amount(message: Message, state: FSMContext):
         if amount < 100:
             raise ValueError
         await state.update_data(amount=amount)
-        await message.answer("👤 Введите ID продавца (кому переведут деньги):")
+        await message.answer("👤 Введите ID продавца (кому переведут деньги):\n\nПример: `7804485863`", parse_mode="Markdown")
         await state.set_state(CreateDeal.waiting_for_partner_id)
     except:
         await message.answer("❌ Неверная сумма! Минимум 100 RUB. Попробуйте снова:")
@@ -202,7 +256,6 @@ async def process_partner(message: Message, state: FSMContext):
     partner_input = message.text.strip()
     partner_id = None
     
-    # Поиск партнера
     if partner_input.isdigit():
         partner_id = int(partner_input)
     
@@ -212,7 +265,7 @@ async def process_partner(message: Message, state: FSMContext):
     
     cursor.execute("SELECT user_id FROM users WHERE user_id=?", (partner_id,))
     if not cursor.fetchone():
-        await message.answer("❌ Пользователь не зарегистрирован в боте! Ему нужно запустить бота командой /start")
+        await message.answer("❌ Пользователь не зарегистрирован! Ему нужно запустить бота командой /start")
         return
     
     data = await state.get_data()
@@ -228,17 +281,21 @@ async def process_partner(message: Message, state: FSMContext):
     """, (deal_id, tag, partner_id, message.from_user.id, amount, commission, "pending", datetime.now(), chat_id))
     db.commit()
     
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Оплатить сделку", callback_data=f"pay_deal_{deal_id}")],
+        [InlineKeyboardButton(text="💬 Чат с продавцом", callback_data=f"chat_{deal_id}")]
+    ])
+    
     await message.answer(
         f"✅ *Сделка создана!*\n\n"
         f"📌 Тег: `{tag}`\n"
         f"💰 Сумма: {format_balance(amount)}\n"
-        f"👤 Продавец: {partner_id}\n"
-        f"👤 Покупатель: {message.from_user.id}\n"
+        f"👤 Продавец: `{partner_id}`\n"
+        f"👤 Покупатель: `{message.from_user.id}`\n"
         f"💸 Комиссия: {commission}%\n\n"
-        f"Покупатель должен пополнить баланс сделки через кнопку ниже.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💰 Пополнить баланс сделки", callback_data=f"pay_deal_{deal_id}")]
-        ]),
+        f"📊 Статус: {get_deal_status_text('pending')}\n\n"
+        f"*Покупатель, нажмите кнопку для оплаты:*",
+        reply_markup=kb,
         parse_mode="Markdown"
     )
     
@@ -249,12 +306,16 @@ async def process_partner(message: Message, state: FSMContext):
             f"🆕 *Новая сделка!*\n\n"
             f"📌 Тег: `{tag}`\n"
             f"💰 Сумма: {format_balance(amount)}\n"
-            f"👤 Покупатель: {message.from_user.id}\n\n"
-            f"Ожидайте оплаты от покупателя.",
+            f"👤 Покупатель: `{message.from_user.id}`\n\n"
+            f"Ожидайте оплаты от покупателя.\n"
+            f"После оплаты вы получите уведомление.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💬 Чат с покупателем", callback_data=f"chat_{deal_id}")]
+            ]),
             parse_mode="Markdown"
         )
-    except:
-        pass
+    except Exception as e:
+        print(f"Failed to notify seller: {e}")
     
     await state.clear()
 
@@ -262,6 +323,7 @@ async def process_partner(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("pay_deal_"))
 async def pay_deal(callback: CallbackQuery):
     deal_id = callback.data.split("_")[2]
+    
     cursor.execute("SELECT * FROM deals WHERE deal_id=?", (deal_id,))
     deal = cursor.fetchone()
     
@@ -269,30 +331,60 @@ async def pay_deal(callback: CallbackQuery):
         await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
     
-    if deal[7] != "pending":
-        await callback.answer("❌ Сделка уже оплачена или завершена", show_alert=True)
+    (deal_id_db, tag, seller_id, buyer_id, amount, commission, 
+     status, created_at, funded_at, completed_at, chat_id, invoice_id, payment_url) = deal
+    
+    if status == "completed":
+        await callback.answer("❌ Сделка уже завершена", show_alert=True)
         return
     
-    if callback.from_user.id != deal[4]:
+    if status == "funded":
+        await callback.answer("❌ Сделка уже оплачена! Средства заморожены.", show_alert=True)
+        return
+    
+    if callback.from_user.id != buyer_id:
         await callback.answer("❌ Только покупатель может оплатить сделку", show_alert=True)
         return
     
-    invoice_id, pay_url = await create_crypto_invoice(deal[5])
-    if not invoice_id:
-        await callback.answer("❌ Ошибка создания платежа. Проверьте настройки CryptoBot", show_alert=True)
+    # Проверяем существующий инвойс
+    if invoice_id:
+        inv_status = await check_invoice_status(invoice_id)
+        if inv_status == "paid":
+            cursor.execute("UPDATE deals SET status='funded', funded_at=? WHERE deal_id=?", (datetime.now(), deal_id))
+            db.commit()
+            await callback.message.answer("✅ *Оплата подтверждена!*", parse_mode="Markdown")
+            await callback.answer("Оплата подтверждена!")
+            return
+    
+    # Создаем новый инвойс
+    await callback.message.answer("🔄 Создаю платеж...")
+    
+    invoice_id_new, pay_url_new = await create_crypto_invoice(amount)
+    
+    if not invoice_id_new:
+        await callback.message.answer("❌ *Ошибка создания платежа*\n\nОбратитесь к администратору.", parse_mode="Markdown")
+        await callback.answer()
         return
     
-    cursor.execute("UPDATE deals SET invoice_id=? WHERE deal_id=?", (invoice_id, deal_id))
+    cursor.execute("UPDATE deals SET invoice_id=?, payment_url=? WHERE deal_id=?", (invoice_id_new, pay_url_new, deal_id))
     db.commit()
     
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", url=pay_url_new)],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment_{deal_id}_{invoice_id_new}")],
+        [InlineKeyboardButton(text="💬 Чат с продавцом", callback_data=f"chat_{deal_id}")]
+    ])
+    
     await callback.message.answer(
-        f"💳 *Оплата сделки {deal[1]}*\n\n"
-        f"Сумма: {format_balance(deal[5])}\n"
-        f"Перейдите по ссылке для оплаты через CryptoBot:\n{pay_url}\n\n"
-        f"⚠️ После оплаты нажмите *«Проверить оплату»*",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment_{deal_id}_{invoice_id}")]
-        ]),
+        f"💳 *Оплата сделки {tag}*\n\n"
+        f"💰 Сумма: {format_balance(amount)}\n"
+        f"📌 Комиссия: {commission}%\n\n"
+        f"*Инструкция:*\n"
+        f"1️⃣ Нажмите «Перейти к оплате»\n"
+        f"2️⃣ Оплатите через CryptoBot\n"
+        f"3️⃣ Нажмите «Проверить оплату»\n\n"
+        f"⚠️ Деньги будут заморожены до вашего подтверждения.",
+        reply_markup=kb,
         parse_mode="Markdown"
     )
     await callback.answer()
@@ -303,31 +395,48 @@ async def check_payment(callback: CallbackQuery):
     deal_id = parts[2]
     invoice_id = parts[3]
     
-    if not CRYPTOBOT_TOKEN or CRYPTOBOT_TOKEN == "ВАШ_CRYPTOBOT_TOKEN":
-        await callback.answer("❌ CryptoBot не настроен", show_alert=True)
-        return
+    await callback.message.answer("🔄 Проверяю статус платежа...")
     
-    url = "https://pay.crypt.bot/api/getInvoices"
-    headers = {"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN}
-    params = {"invoice_ids": invoice_id}
+    inv_status = await check_invoice_status(invoice_id)
     
-    try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
-        result = response.json()
+    if inv_status == "paid":
+        cursor.execute("UPDATE deals SET status='funded', funded_at=? WHERE deal_id=?", (datetime.now(), deal_id))
+        db.commit()
         
-        if result.get("ok") and result["result"]["items"]:
-            invoice = result["result"]["items"][0]
-            if invoice["status"] == "paid":
-                cursor.execute("UPDATE deals SET status='funded', funded_at=? WHERE deal_id=?", (datetime.now(), deal_id))
-                db.commit()
-                await callback.message.answer("✅ *Оплата подтверждена! Деньги заморожены до подтверждения покупателя.*", parse_mode="Markdown")
-                await callback.answer("Оплата подтверждена!")
-            else:
-                await callback.answer("❌ Платеж еще не оплачен", show_alert=True)
-        else:
-            await callback.answer("❌ Не удалось проверить платеж", show_alert=True)
-    except Exception as e:
-        await callback.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
+        cursor.execute("SELECT tag, seller_id, buyer_id, amount FROM deals WHERE deal_id=?", (deal_id,))
+        deal = cursor.fetchone()
+        
+        # Уведомляем продавца
+        try:
+            await bot.send_message(
+                deal[1],
+                f"✅ *Сделка {deal[0]} оплачена!*\n\n"
+                f"💰 Сумма: {format_balance(deal[3])}\n"
+                f"Деньги заморожены до подтверждения покупателя.",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+        
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить получение", callback_data=f"confirm_deal_{deal_id}")],
+            [InlineKeyboardButton(text="💬 Чат с продавцом", callback_data=f"chat_{deal_id}")]
+        ])
+        
+        await callback.message.answer(
+            "✅ *Оплата подтверждена!*\n\n"
+            "Деньги заморожены на счете гаранта.\n"
+            "После получения товара нажмите «Подтвердить получение».",
+            reply_markup=kb,
+            parse_mode="Markdown"
+        )
+        
+    elif inv_status == "active":
+        await callback.message.answer("⏳ *Платеж еще не оплачен*\n\nОплатите и нажмите проверку снова.", parse_mode="Markdown")
+    else:
+        await callback.message.answer("❌ *Не удалось проверить платеж*\n\nПопробуйте позже.", parse_mode="Markdown")
+    
+    await callback.answer()
 
 # ========== ПОДТВЕРЖДЕНИЕ ПОЛУЧЕНИЯ ==========
 @dp.callback_query(F.data.startswith("confirm_deal_"))
@@ -336,35 +445,41 @@ async def confirm_deal(callback: CallbackQuery):
     cursor.execute("SELECT * FROM deals WHERE deal_id=?", (deal_id,))
     deal = cursor.fetchone()
     
-    if not deal or deal[7] != "funded":
-        await callback.answer("❌ Невозможно подтвердить", show_alert=True)
+    if not deal:
+        await callback.answer("❌ Сделка не найдена", show_alert=True)
         return
     
-    if callback.from_user.id != deal[4]:
+    (deal_id_db, tag, seller_id, buyer_id, amount, commission, 
+     status, created_at, funded_at, completed_at, chat_id, invoice_id, payment_url) = deal
+    
+    if status != "funded":
+        await callback.answer(f"❌ Невозможно подтвердить. Статус: {status}", show_alert=True)
+        return
+    
+    if callback.from_user.id != buyer_id:
         await callback.answer("❌ Только покупатель может подтвердить", show_alert=True)
         return
     
-    # Начисляем деньги продавцу с учетом комиссии
-    amount = deal[5]
-    commission = deal[6]
     seller_payout = amount * (1 - commission / 100)
     
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (seller_payout, deal[3]))
-    cursor.execute("UPDATE deals SET status='completed' WHERE deal_id=?", (deal_id,))
+    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (seller_payout, seller_id))
+    cursor.execute("UPDATE deals SET status='completed', completed_at=? WHERE deal_id=?", (datetime.now(), deal_id))
     db.commit()
     
     await callback.message.answer(
-        f"✅ *Сделка завершена!*\n\n"
-        f"Продавцу {deal[3]} начислено {format_balance(seller_payout)} (комиссия {commission}%)",
+        f"✅ *Сделка успешно завершена!*\n\n"
+        f"📌 Тег: {tag}\n"
+        f"💰 Продавцу начислено: {format_balance(seller_payout)}\n"
+        f"💸 Комиссия: {format_balance(amount * commission / 100)}\n\n"
+        f"Спасибо за использование сервиса!",
         parse_mode="Markdown"
     )
     
-    # Уведомляем продавца
     try:
         await bot.send_message(
-            deal[3],
-            f"✅ *Сделка {deal[1]} завершена!*\n\n"
-            f"Вам начислено {format_balance(seller_payout)}",
+            seller_id,
+            f"✅ *Сделка {tag} завершена!*\n\n"
+            f"💰 Вам начислено: {format_balance(seller_payout)}",
             parse_mode="Markdown"
         )
     except:
@@ -372,59 +487,34 @@ async def confirm_deal(callback: CallbackQuery):
     
     await callback.answer()
 
-# ========== МОИ СДЕЛКИ ==========
-@dp.callback_query(F.data == "my_deals")
-async def my_deals(callback: CallbackQuery):
-    user_id = cursor.execute("""
-        SELECT deal_id, tag, amount, status, seller_id, buyer_id 
-        FROM deals WHERE seller_id=? OR buyer_id=?
-    """, (callback.from_user.id, callback.from_user.id))
-    deals = cursor.fetchall()
-    
-    if not deals:
-        await callback.message.answer("📭 У вас пока нет сделок")
-        await callback.answer()
-        return
-    
-    text = "📋 *Ваши сделки:*\n\n"
-    for deal in deals:
-        role = "📤 Продавец" if deal[4] == callback.from_user.id else "📥 Покупатель"
-        status_emoji = {
-            "pending": "⏳ Ожидает оплаты",
-            "funded": "💎 Средства заморожены",
-            "completed": "✅ Завершена"
-        }.get(deal[3], deal[3])
-        
-        text += f"`{deal[1]}`\n{role} | {format_balance(deal[2])} | {status_emoji}\n"
-        
-        # Добавляем кнопку чата если сделка активна
-        if deal[3] in ["pending", "funded"]:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="💬 Чат сделки", callback_data=f"chat_{deal[0]}")]
-            ])
-            await callback.message.answer(text, reply_markup=kb, parse_mode="Markdown")
-            text = ""
-    
-    if text:
-        await callback.message.answer(text, parse_mode="Markdown")
-    await callback.answer()
-
-# ========== ЧАТ ==========
+# ========== ЧАТ МЕЖДУ УЧАСТНИКАМИ ==========
 @dp.callback_query(F.data.startswith("chat_"))
 async def open_chat(callback: CallbackQuery, state: FSMContext):
     deal_id = callback.data.split("_")[1]
-    cursor.execute("SELECT seller_id, buyer_id FROM deals WHERE deal_id=?", (deal_id,))
+    cursor.execute("SELECT seller_id, buyer_id, tag FROM deals WHERE deal_id=?", (deal_id,))
     deal = cursor.fetchone()
     
     if not deal or callback.from_user.id not in [deal[0], deal[1]]:
         await callback.answer("❌ Нет доступа к чату", show_alert=True)
         return
     
-    await state.update_data(current_deal=deal_id, current_chat_deal=deal_id)
+    await state.update_data(current_chat_deal=deal_id, current_chat_tag=deal[2])
+    
+    # Показываем последние сообщения
+    cursor.execute("SELECT from_id, message_text, timestamp FROM messages WHERE deal_id=? ORDER BY timestamp DESC LIMIT 10", (deal_id,))
+    messages = cursor.fetchall()
+    
+    if messages:
+        history = "📜 *Последние сообщения:*\n\n"
+        for msg in reversed(messages):
+            sender = "Вы" if msg[0] == callback.from_user.id else ("Продавец" if msg[0] == deal[0] else "Покупатель")
+            history += f"`[{msg[2].strftime('%H:%M')}]` {sender}: {msg[1][:50]}\n"
+        await callback.message.answer(history[:4000], parse_mode="Markdown")
+    
     await callback.message.answer(
-        "💬 *Чат сделки*\n"
-        "Отправляйте сообщения, они будут видны только участникам сделки.\n"
-        "Для выхода нажмите /exit_chat",
+        f"💬 *Чат сделки {deal[2]}*\n\n"
+        f"Отправляйте сообщения, они будут видны только участникам сделки.\n"
+        f"Для выхода нажмите /exit_chat",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚪 Выйти из чата", callback_data="exit_chat")]
         ]),
@@ -436,7 +526,7 @@ async def open_chat(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "exit_chat")
 async def exit_chat_cmd(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("🚪 Вы вышли из чата", reply_markup=main_menu(callback.from_user.id))
+    await callback.message.answer("🚪 Вы вышли из чата", reply_markup=main_menu(callback.from_user.id))
     await callback.answer()
 
 @dp.message(AdminState.watching_chat)
@@ -446,7 +536,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
     if not deal_id:
         return
     
-    cursor.execute("SELECT seller_id, buyer_id FROM deals WHERE deal_id=?", (deal_id,))
+    cursor.execute("SELECT seller_id, buyer_id, tag FROM deals WHERE deal_id=?", (deal_id,))
     deal = cursor.fetchone()
     
     if not deal:
@@ -464,7 +554,7 @@ async def handle_chat_message(message: Message, state: FSMContext):
     try:
         await bot.send_message(
             partner_id,
-            f"💬 *Новое сообщение в сделке*\n"
+            f"💬 *Новое сообщение в сделке {deal[2]}*\n"
             f"От: {'Продавец' if message.from_user.id == deal[0] else 'Покупатель'}\n\n"
             f"{message.text}",
             parse_mode="Markdown",
@@ -473,20 +563,98 @@ async def handle_chat_message(message: Message, state: FSMContext):
             ])
         )
     except Exception as e:
-        print(f"Failed to send message to {partner_id}: {e}")
+        print(f"Failed to send: {e}")
 
-# ========== ПОПОЛНЕНИЕ БАЛАНСА ==========
-@dp.callback_query(F.data == "deposit")
-async def deposit(callback: CallbackQuery):
-    await callback.message.answer("💰 Пополнение баланса через CryptoBot временно недоступно.\nИспользуйте создание сделки для оплаты.")
+# ========== ЧАТ ПОДДЕРЖКИ ==========
+@dp.callback_query(F.data == "support_chat")
+async def support_chat(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "💬 *Чат поддержки*\n\n"
+        "Напишите ваше сообщение администратору.\n"
+        "Мы ответим вам в ближайшее время.\n\n"
+        "Для отмены нажмите /cancel",
+        parse_mode="Markdown"
+    )
+    await state.set_state(SupportState.waiting_message)
     await callback.answer()
+
+@dp.message(SupportState.waiting_message)
+async def process_support_message(message: Message, state: FSMContext):
+    # Сохраняем сообщение в БД
+    cursor.execute("""
+        INSERT INTO messages (deal_id, from_id, message_text, timestamp)
+        VALUES (?, ?, ?, ?)
+    """, ("support", message.from_user.id, f"[ПОДДЕРЖКА] {message.text}", datetime.now()))
+    db.commit()
+    
+    # Отправляем админу
+    await bot.send_message(
+        ADMIN_ID,
+        f"📩 *Новое сообщение в поддержку*\n\n"
+        f"От: {message.from_user.id}\n"
+        f"Username: @{message.from_user.username or 'None'}\n\n"
+        f"Сообщение:\n{message.text}",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"reply_support_{message.from_user.id}")]
+        ])
+    )
+    
+    await message.answer("✅ Ваше сообщение отправлено администратору. Ответ придет в этот чат.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("reply_support_"))
+async def reply_support(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+    
+    user_id = int(callback.data.split("_")[2])
+    await state.update_data(reply_user_id=user_id)
+    await callback.message.answer("✏️ Введите ответ пользователю:")
+    await state.set_state(AdminState.waiting_support_reply)
+    await callback.answer()
+
+@dp.message(AdminState.waiting_support_reply)
+async def process_support_reply(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get('reply_user_id')
+    
+    if not user_id:
+        await message.answer("❌ Ошибка")
+        await state.clear()
+        return
+    
+    try:
+        await bot.send_message(
+            user_id,
+            f"📩 *Ответ от поддержки:*\n\n{message.text}\n\n"
+            f"Для нового вопроса напишите /start и нажмите «Чат поддержки»",
+            parse_mode="Markdown"
+        )
+        await message.answer("✅ Ответ отправлен пользователю")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки: {e}")
+    
+    await state.clear()
 
 # ========== ВЫВОД СРЕДСТВ ==========
 @dp.callback_query(F.data == "withdraw")
 async def withdraw_start(callback: CallbackQuery, state: FSMContext):
     cursor.execute("SELECT balance FROM users WHERE user_id=?", (callback.from_user.id,))
     balance = cursor.fetchone()[0]
-    await callback.message.answer(f"💰 Ваш баланс: {format_balance(balance)}\n\nВведите сумму вывода (мин. 100 RUB):")
+    
+    if balance < 100:
+        await callback.answer(f"❌ Минимальная сумма вывода 100 RUB. Ваш баланс: {format_balance(balance)}", show_alert=True)
+        return
+    
+    await callback.message.answer(
+        f"💰 *Вывод средств*\n\n"
+        f"Ваш баланс: {format_balance(balance)}\n"
+        f"Мин. сумма: 100 RUB\n\n"
+        f"Введите сумму вывода:",
+        parse_mode="Markdown"
+    )
     await state.set_state(WithdrawState.waiting_for_amount)
     await callback.answer()
 
@@ -496,42 +664,113 @@ async def withdraw_amount(message: Message, state: FSMContext):
         amount = float(message.text)
         cursor.execute("SELECT balance FROM users WHERE user_id=?", (message.from_user.id,))
         balance = cursor.fetchone()[0]
-        if amount < 100 or amount > balance:
-            raise ValueError
+        
+        if amount < 100:
+            await message.answer("❌ Минимальная сумма вывода 100 RUB")
+            return
+        if amount > balance:
+            await message.answer(f"❌ Недостаточно средств. Ваш баланс: {format_balance(balance)}")
+            return
+        
         await state.update_data(amount=amount)
-        await message.answer("💳 Введите адрес кошелька USDT (TRC20):")
+        await message.answer("💳 Введите адрес кошелька USDT (TRC20):\n\nПример: `TX7cqUBeJovQRfZq5YHtT7jqHByL5ZpXtZ`", parse_mode="Markdown")
         await state.set_state(WithdrawState.waiting_for_wallet)
-    except:
-        await message.answer("❌ Неверная сумма или недостаточно средств! Минимум 100 RUB.")
+    except ValueError:
+        await message.answer("❌ Введите корректную сумму")
 
 @dp.message(WithdrawState.waiting_for_wallet)
 async def withdraw_wallet(message: Message, state: FSMContext):
     data = await state.get_data()
     withdraw_id = str(uuid.uuid4())[:8]
+    wallet = message.text.strip()
+    
+    # Простая проверка адреса TRC20
+    if not wallet.startswith('T') or len(wallet) < 30:
+        await message.answer("❌ Неверный формат адреса TRC20. Попробуйте снова:")
+        return
+    
     cursor.execute("""
         INSERT INTO withdraws (withdraw_id, user_id, amount, wallet_address, status, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (withdraw_id, message.from_user.id, data['amount'], message.text, "pending", datetime.now()))
+    """, (withdraw_id, message.from_user.id, data['amount'], wallet, "pending", datetime.now()))
+    
     cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id=?", (data['amount'], message.from_user.id))
     db.commit()
     
-    await message.answer(f"✅ Заявка на вывод #{withdraw_id} создана! Ожидайте обработки администратором.")
+    await message.answer(
+        f"✅ *Заявка на вывод создана!*\n\n"
+        f"📤 ID: {withdraw_id}\n"
+        f"💰 Сумма: {format_balance(data['amount'])}\n"
+        f"💳 Кошелек: `{wallet}`\n\n"
+        f"Статус: ⏳ Ожидает обработки\n\n"
+        f"Администратор обработает заявку в ближайшее время.",
+        parse_mode="Markdown"
+    )
     
     # Уведомляем администратора
     await bot.send_message(
         ADMIN_ID,
         f"📤 *Новая заявка на вывод*\n\n"
-        f"ID: {withdraw_id}\n"
-        f"Пользователь: {message.from_user.id}\n"
-        f"Сумма: {format_balance(data['amount'])}\n"
-        f"Кошелек: {message.text}",
+        f"🆔 ID: {withdraw_id}\n"
+        f"👤 Пользователь: {message.from_user.id}\n"
+        f"💰 Сумма: {format_balance(data['amount'])}\n"
+        f"💳 Кошелек: `{wallet}`\n"
+        f"📅 Создана: {datetime.now().strftime('%d.%m.%Y %H:%M')}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"approve_withdraw_{withdraw_id}"),
              InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_withdraw_{withdraw_id}")]
         ])
     )
+    
     await state.clear()
+
+# ========== МОИ СДЕЛКИ ==========
+@dp.callback_query(F.data == "my_deals")
+async def my_deals(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    cursor.execute("""
+        SELECT deal_id, tag, amount, status, seller_id, buyer_id, created_at 
+        FROM deals WHERE seller_id=? OR buyer_id=?
+        ORDER BY created_at DESC
+    """, (user_id, user_id))
+    deals = cursor.fetchall()
+    
+    if not deals:
+        await callback.message.answer("📭 *У вас пока нет сделок*\n\nСоздайте новую сделку через главное меню.", parse_mode="Markdown")
+        await callback.answer()
+        return
+    
+    for deal in deals:
+        (deal_id, tag, amount, status, seller_id, buyer_id, created_at) = deal
+        role = "📤 Продавец" if seller_id == user_id else "📥 Покупатель"
+        
+        text = (
+            f"┌ *Сделка*\n"
+            f"├ 📌 Тег: `{tag}`\n"
+            f"├ 💰 Сумма: {format_balance(amount)}\n"
+            f"├ 👤 {role}\n"
+            f"├ 📅 Создана: {created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"└ 📊 Статус: {get_deal_status_text(status)}\n"
+        )
+        
+        buttons = []
+        
+        if status == "pending" and role == "📥 Покупатель":
+            buttons.append([InlineKeyboardButton(text="💰 Оплатить", callback_data=f"pay_deal_{deal_id}")])
+        
+        if status == "funded" and role == "📥 Покупатель":
+            buttons.append([InlineKeyboardButton(text="✅ Подтвердить получение", callback_data=f"confirm_deal_{deal_id}")])
+        
+        if status in ["pending", "funded"]:
+            buttons.append([InlineKeyboardButton(text="💬 Чат", callback_data=f"chat_{deal_id}")])
+        
+        if buttons:
+            await callback.message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+        else:
+            await callback.message.answer(text, parse_mode="Markdown")
+    
+    await callback.answer()
 
 # ========== АДМИН-ПАНЕЛЬ ==========
 @dp.callback_query(F.data == "admin_panel")
@@ -547,7 +786,9 @@ async def set_commission(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа")
         return
-    await callback.message.answer("💰 Введите новую комиссию (0-50):")
+    
+    current = get_commission()
+    await callback.message.answer(f"💰 Текущая комиссия: {current}%\n\nВведите новую комиссию (0-50):")
     await state.set_state(AdminState.waiting_commission)
     await callback.answer()
 
@@ -571,7 +812,7 @@ async def admin_deals(callback: CallbackQuery):
         await callback.answer("Нет доступа")
         return
     
-    cursor.execute("SELECT deal_id, tag, amount, status, seller_id, buyer_id FROM deals ORDER BY created_at DESC LIMIT 20")
+    cursor.execute("SELECT tag, amount, status, seller_id, buyer_id, created_at FROM deals ORDER BY created_at DESC LIMIT 20")
     deals = cursor.fetchall()
     
     if not deals:
@@ -579,11 +820,103 @@ async def admin_deals(callback: CallbackQuery):
         await callback.answer()
         return
     
-    text = "📋 *Последние сделки:*\n\n"
+    text = "📋 *Последние 20 сделок:*\n\n"
     for deal in deals:
-        text += f"`{deal[1]}` | {format_balance(deal[2])} | {deal[3]}\nПродавец: {deal[4]} | Покупатель: {deal[5]}\n\n"
+        text += f"`{deal[0]}` | {format_balance(deal[1])} | {deal[2]}\n"
+        text += f"└ Продавец: {deal[3]} | Покупатель: {deal[4]}\n"
+        text += f"└ Создана: {deal[5].strftime('%d.%m.%Y %H:%M')}\n\n"
+    
+    # Разбиваем на части если слишком длинное
+    if len(text) > 4000:
+        text = text[:4000]
     
     await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+    
+    cursor.execute("SELECT COUNT(*) FROM users")
+    users_count = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM deals")
+    total_deals = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT COUNT(*) FROM deals WHERE status='completed'")
+    completed_deals = cursor.fetchone()[0]
+    
+    cursor.execute("SELECT SUM(amount) FROM deals WHERE status='completed'")
+    total_volume = cursor.fetchone()[0] or 0
+    
+    cursor.execute("SELECT COUNT(*) FROM withdraws WHERE status='pending'")
+    pending_withdraws = cursor.fetchone()[0]
+    
+    text = (
+        f"📊 *Статистика бота*\n\n"
+        f"👥 Пользователей: {users_count}\n"
+        f"📋 Всего сделок: {total_deals}\n"
+        f"✅ Завершенных: {completed_deals}\n"
+        f"💰 Общий объем: {format_balance(total_volume)}\n"
+        f"💸 Заявок на вывод: {pending_withdraws}\n"
+        f"💸 Комиссия: {get_commission()}%"
+    )
+    
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_reset_deal")
+async def admin_reset_deal(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+    
+    cursor.execute("SELECT deal_id, tag, status FROM deals WHERE status != 'completed'")
+    deals = cursor.fetchall()
+    
+    if not deals:
+        await callback.message.answer("📭 Нет активных сделок")
+        await callback.answer()
+        return
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{deal[1]} [{get_deal_status_text(deal[2])}]", callback_data=f"reset_deal_{deal[0]}")] 
+        for deal in deals[:10]
+    ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
+    
+    await callback.message.answer("🔧 *Выберите сделку для сброса статуса:*\n\nПосле сброса статус станет 'pending'", 
+                                  reply_markup=kb, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("reset_deal_"))
+async def reset_deal_status(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа")
+        return
+    
+    deal_id = callback.data.split("_")[2]
+    
+    cursor.execute("UPDATE deals SET status='pending', funded_at=NULL, completed_at=NULL WHERE deal_id=?", (deal_id,))
+    db.commit()
+    
+    cursor.execute("SELECT tag, buyer_id FROM deals WHERE deal_id=?", (deal_id,))
+    deal = cursor.fetchone()
+    
+    await callback.message.answer(f"✅ Статус сделки {deal[0]} сброшен на 'pending'")
+    
+    try:
+        await bot.send_message(
+            deal[1],
+            f"🔄 *Статус сделки {deal[0]} сброшен администратором*\n\n"
+            f"Вы можете снова оплатить сделку через «Мои сделки»",
+            parse_mode="Markdown"
+        )
+    except:
+        pass
+    
     await callback.answer()
 
 @dp.callback_query(F.data == "admin_withdraws")
@@ -592,7 +925,7 @@ async def admin_withdraws(callback: CallbackQuery):
         await callback.answer("Нет доступа")
         return
     
-    cursor.execute("SELECT withdraw_id, user_id, amount, wallet_address, status FROM withdraws WHERE status='pending'")
+    cursor.execute("SELECT withdraw_id, user_id, amount, wallet_address, created_at FROM withdraws WHERE status='pending' ORDER BY created_at ASC")
     withdraws = cursor.fetchall()
     
     if not withdraws:
@@ -602,10 +935,12 @@ async def admin_withdraws(callback: CallbackQuery):
     
     for w in withdraws:
         await callback.message.answer(
-            f"📤 *Заявка {w[0]}*\n"
-            f"Пользователь: {w[1]}\n"
-            f"Сумма: {format_balance(w[2])}\n"
-            f"Кошелек: `{w[3]}`",
+            f"📤 *Заявка на вывод*\n\n"
+            f"🆔 ID: `{w[0]}`\n"
+            f"👤 Пользователь: {w[1]}\n"
+            f"💰 Сумма: {format_balance(w[2])}\n"
+            f"💳 Кошелек: `{w[3]}`\n"
+            f"📅 Создана: {w[4].strftime('%d.%m.%Y %H:%M')}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"approve_withdraw_{w[0]}"),
                  InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_withdraw_{w[0]}")]
@@ -621,8 +956,9 @@ async def approve_withdraw(callback: CallbackQuery):
         return
     
     withdraw_id = callback.data.split("_")[2]
-    cursor.execute("UPDATE withdraws SET status='completed' WHERE withdraw_id=?", (withdraw_id,))
+    cursor.execute("UPDATE withdraws SET status='completed', processed_at=? WHERE withdraw_id=?", (datetime.now(), withdraw_id))
     db.commit()
+    
     await callback.message.edit_text(f"✅ Вывод {withdraw_id} подтвержден!")
     await callback.answer()
 
@@ -635,11 +971,16 @@ async def reject_withdraw(callback: CallbackQuery):
     withdraw_id = callback.data.split("_")[2]
     cursor.execute("SELECT user_id, amount FROM withdraws WHERE withdraw_id=?", (withdraw_id,))
     w = cursor.fetchone()
+    
     if w:
         cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (w[1], w[0]))
-        cursor.execute("UPDATE withdraws SET status='rejected' WHERE withdraw_id=?", (withdraw_id,))
+        cursor.execute("UPDATE withdraws SET status='rejected', processed_at=? WHERE withdraw_id=?", (datetime.now(), withdraw_id))
         db.commit()
-        await bot.send_message(w[0], f"❌ Ваша заявка на вывод {format_balance(w[1])} отклонена. Средства возвращены на баланс.")
+        
+        try:
+            await bot.send_message(w[0], f"❌ Ваша заявка на вывод {format_balance(w[1])} отклонена. Средства возвращены на баланс.")
+        except:
+            pass
     
     await callback.message.edit_text(f"❌ Вывод {withdraw_id} отклонен!")
     await callback.answer()
@@ -649,7 +990,7 @@ async def broadcast_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа")
         return
-    await callback.message.answer("📢 Введите текст для рассылки:")
+    await callback.message.answer("📢 Введите текст для рассылки (поддерживается Markdown):")
     await state.set_state(AdminState.waiting_broadcast_text)
     await callback.answer()
 
@@ -661,17 +1002,21 @@ async def process_broadcast(message: Message, state: FSMContext):
     success = 0
     fail = 0
     
-    await message.answer(f"🚀 Начинаю рассылку {len(users)} пользователям...")
+    status_msg = await message.answer(f"🚀 Начинаю рассылку {len(users)} пользователям...")
     
     for user in users:
         try:
-            await bot.send_message(user[0], f"📢 *Рассылка от администратора:*\n\n{message.text}", parse_mode="Markdown")
+            await bot.send_message(
+                user[0], 
+                f"📢 *Рассылка от администратора:*\n\n{message.text}", 
+                parse_mode="Markdown"
+            )
             success += 1
         except:
             fail += 1
-        await asyncio.sleep(0.05)  # Защита от блокировки
+        await asyncio.sleep(0.05)
     
-    await message.answer(f"✅ Рассылка завершена!\nДоставлено: {success}\nОшибок: {fail}")
+    await status_msg.edit_text(f"✅ Рассылка завершена!\n\n📨 Доставлено: {success}\n❌ Ошибок: {fail}")
     await state.clear()
 
 @dp.callback_query(F.data == "admin_watch_chat")
@@ -680,7 +1025,7 @@ async def admin_watch_chat(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Нет доступа")
         return
     
-    cursor.execute("SELECT deal_id, tag FROM deals WHERE status != 'completed'")
+    cursor.execute("SELECT deal_id, tag, status FROM deals WHERE status != 'completed' ORDER BY created_at DESC LIMIT 20")
     deals = cursor.fetchall()
     
     if not deals:
@@ -689,10 +1034,12 @@ async def admin_watch_chat(callback: CallbackQuery, state: FSMContext):
         return
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{deal[1]}", callback_data=f"admin_chat_{deal[0]}")] for deal in deals[:10]
+        [InlineKeyboardButton(text=f"{deal[1]} [{get_deal_status_text(deal[2])}]", callback_data=f"admin_chat_{deal[0]}")] 
+        for deal in deals[:15]
     ])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")])
     
-    await callback.message.answer("Выберите сделку для просмотра чата:", reply_markup=kb)
+    await callback.message.answer("👁 *Выберите сделку для просмотра чата:*", reply_markup=kb, parse_mode="Markdown")
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("admin_chat_"))
@@ -704,18 +1051,17 @@ async def admin_enter_chat(callback: CallbackQuery, state: FSMContext):
     deal_id = callback.data.split("_")[2]
     await state.update_data(current_chat_deal=deal_id)
     
-    # Показываем последние 20 сообщений
-    cursor.execute("SELECT from_id, message_text, timestamp FROM messages WHERE deal_id=? ORDER BY timestamp DESC LIMIT 20", (deal_id,))
+    cursor.execute("SELECT from_id, message_text, timestamp FROM messages WHERE deal_id=? ORDER BY timestamp DESC LIMIT 30", (deal_id,))
     messages = cursor.fetchall()
     
     if messages:
         text = "📜 *История чата:*\n\n"
         for msg in reversed(messages):
-            text += f"[{msg[2].strftime('%H:%M')}] Пользователь {msg[0]}: {msg[1][:50]}\n"
+            text += f"`[{msg[2].strftime('%H:%M:%S')}]` Пользователь {msg[0]}: {msg[1][:60]}\n"
         await callback.message.answer(text[:4000], parse_mode="Markdown")
     
     await callback.message.answer(
-        "👁️ *Вы наблюдаете за чатом*\n"
+        "👁️ *Вы наблюдаете за чатом*\n\n"
         "Администратор видит все сообщения, но может только читать.\n"
         "Для выхода нажмите /exit_chat",
         parse_mode="Markdown"
@@ -723,49 +1069,16 @@ async def admin_enter_chat(callback: CallbackQuery, state: FSMContext):
     await state.set_state(AdminState.watching_chat)
     await callback.answer()
 
-@dp.callback_query(F.data == "admin_close_deal")
-async def admin_close_deal_start(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа")
-        return
-    await callback.message.answer("Введите ID или тег сделки для принудительного закрытия:")
-    await state.set_state(AdminState.waiting_deal_id)
-    await callback.answer()
-
-@dp.message(AdminState.waiting_deal_id)
-async def admin_close_deal(message: Message, state: FSMContext):
-    deal_input = message.text.strip()
-    
-    # Поиск сделки по тегу или ID
-    cursor.execute("SELECT deal_id, seller_id, buyer_id, amount, commission, status FROM deals WHERE tag=? OR deal_id=?", (deal_input, deal_input))
-    deal = cursor.fetchone()
-    
-    if not deal:
-        await message.answer("❌ Сделка не найдена")
-        return
-    
-    if deal[5] == "completed":
-        await message.answer("❌ Сделка уже завершена")
-        return
-    
-    # Принудительное закрытие
-    if deal[5] == "funded":
-        seller_payout = deal[3] * (1 - deal[4] / 100)
-        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (seller_payout, deal[1]))
-        cursor.execute("UPDATE deals SET status='completed' WHERE deal_id=?", (deal[0],))
-        db.commit()
-        await message.answer(f"✅ Сделка принудительно закрыта. Продавцу начислено {format_balance(seller_payout)}")
-    else:
-        cursor.execute("UPDATE deals SET status='closed' WHERE deal_id=?", (deal[0],))
-        db.commit()
-        await message.answer(f"✅ Сделка отменена администратором")
-    
+@dp.message(Command("cancel"))
+async def cancel_cmd(message: Message, state: FSMContext):
     await state.clear()
+    await message.answer("❌ Действие отменено", reply_markup=main_menu(message.from_user.id))
 
-# ========== ЗАПУСК БОТА ==========
+# ========== ЗАПУСК ==========
 async def main():
-    print("🤖 Бот-гарант запущен!")
-    print(f"Администратор: {ADMIN_ID}")
+    print("🤖 UralGarant бот запущен!")
+    print(f"👑 Администратор: {ADMIN_ID}")
+    print(f"💬 Бот: @{BOT_TOKEN.split(':')[0]}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
